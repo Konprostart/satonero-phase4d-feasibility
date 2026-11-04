@@ -82,6 +82,22 @@ jobs:
           PY
           test "$(sha256sum "$f" | cut -d' ' -f1)" = "b5b35e3d596f26552c42a63ac13134722a8924c7fca451e43ab221e3368ed00e"
           echo "patched Dockerfile sha256 verified"
+      - name: Apply runner-only healthcheck fix to mostro-regtest compose (not committed)
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          f=docker-compose.yml
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "ac08e210765c0c95cd255be2045127f595b3da8d66a27288a4b254ff8b71ea4d"
+          python3 - <<'PY'
+          p = "docker-compose.yml"
+          src = open(p, encoding="utf-8").read()
+          old = "nak relay nostr_relay:8080"
+          new = "nak relay http://nostr_relay:8080"
+          assert src.count(old) == 1, src.count(old)
+          open(p, "w", encoding="utf-8").write(src.replace(old, new))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "65a3d14cc76245ec6dca5b1b939e934cbd509fe8788c1935d940def9be606b0c"
+          echo "patched docker-compose.yml sha256 verified"
       - name: Build Satonero daemon image (build only, no up)
         working-directory: satonero
         timeout-minutes: 40
