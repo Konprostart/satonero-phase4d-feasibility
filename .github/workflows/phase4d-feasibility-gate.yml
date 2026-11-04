@@ -82,12 +82,27 @@ jobs:
           PY
           test "$(sha256sum "$f" | cut -d' ' -f1)" = "b5b35e3d596f26552c42a63ac13134722a8924c7fca451e43ab221e3368ed00e"
           echo "patched Dockerfile sha256 verified"
+      - name: Build Satonero daemon image (build only, no up)
+        working-directory: satonero
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          docker compose -f docker/compose.yml build mostro
+          echo "BUILD_SECONDS=$(( $(date +%s) - start ))"
+      - name: Disk checkpoint (floor >= 3 GB free)
+        run: |
+          set -euo pipefail
+          free_kb=$(df --output=avail -k / | tail -1)
+          echo "free_kb=$free_kb"
+          if [ "$free_kb" -lt 3145728 ]; then echo "INFEASIBLE-DISK: < 3 GB free"; exit 1; fi
       - name: Start regtest services (named volumes only, no channel init)
         working-directory: mostro-regtest
         run: |
           set -euo pipefail
           docker compose up -d bitcoin mostro_lnd alice_lnd bob_lnd nostr_relay
       - name: Wait for healthchecks (max 10 min, per-service status)
+        id: health
         working-directory: mostro-regtest
         run: |
           set -euo pipefail
@@ -98,7 +113,22 @@ jobs:
             sleep 10
           done
           echo "FAIL: healthchecks not all healthy"; exit 1
-      - name: Build and container summary
+      - name: Diagnostics for nostr_relay (only when unhealthy; no healthcheck changes)
+        if: always() && steps.health.outcome == 'failure'
+        working-directory: mostro-regtest
+        run: |
+          cid=$(docker compose ps -q nostr_relay)
+          echo "== docker inspect State.Health (nostr_relay) =="
+          docker inspect --format '{{json .State.Health}}' "$cid" || echo "inspect failed"
+          echo "== docker compose ps -a (nostr_relay) =="
+          docker compose ps -a nostr_relay || true
+          echo "== nostr_relay container logs (last 300 lines) =="
+          docker compose logs --no-color --tail 300 nostr_relay || true
+          echo "== nak relay nostr_relay:8080 =="
+          docker compose exec -T nostr_relay sh -c 'nak relay nostr_relay:8080; echo EXIT=$?' 2>&1 || true
+          echo "== nak relay http://nostr_relay:8080 =="
+          docker compose exec -T nostr_relay sh -c 'nak relay http://nostr_relay:8080; echo EXIT=$?' 2>&1 || true
+      - name: Disk and container summary
         if: always()
         working-directory: mostro-regtest
         run: |
