@@ -129,207 +129,202 @@ jobs:
             sleep 10
           done
           echo "FAIL: healthchecks not all healthy"; exit 1
-      - name: Generate disposable daemon key (runner temp only, no tracing)
+      - name: Positive control - generate disposable control key (runner temp, no tracing)
         working-directory: mostro-regtest
         run: |
           set +x
           set -euo pipefail
           umask 077
           hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
-          nsec=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay encode nsec "$hex")
+          printf '%s' "$hex" > "$RUNNER_TEMP/ctl.hex"
           pub=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key public "$hex")
-          printf '%s' "$nsec" > "$RUNNER_TEMP/daemon.nsec"
-          printf '%s' "$pub" > "$RUNNER_TEMP/daemon.pub"
-          test "$(wc -c < "$RUNNER_TEMP/daemon.nsec")" -gt 60
-          echo "disposable daemon pubkey (public): $pub"
-      - name: Build runner-only daemon settings (values not printed)
-        working-directory: satonero
-        run: |
-          set +x
-          set -euo pipefail
-          umask 077
-          python3 - <<'PY'
-          import os, tomllib
-          rt = os.environ["RUNNER_TEMP"]
-          src = open("settings.tpl.toml", encoding="utf-8").read()
-          nsec = open(os.path.join(rt, "daemon.nsec"), encoding="utf-8").read().strip()
-          reps = [
-              ("lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'",
-               "lnd_cert_file = '/config/lnd/tls.cert'"),
-              ("lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'",
-               "lnd_macaroon_file = '/config/lnd/admin.macaroon'"),
-              ("lnd_grpc_host = 'https://127.0.0.1:10001'",
-               "lnd_grpc_host = 'https://mostro_lnd:10001'"),
-              ("nsec_privkey = 'nsec1...'",
-               "nsec_privkey = '" + nsec + "'"),
-              ("relays = ['ws://localhost:7000']",
-               "relays = ['ws://nostr_relay:8080']"),
-              ('bitcoin_price_api_url = "https://api.yadio.io"',
-               'bitcoin_price_api_url = "http://127.0.0.1:9"'),
-          ]
-          out = src
-          for old, new in reps:
-              n = out.count(old)
-              assert n == 1, (old[:50], n)
-              out = out.replace(old, new)
-          cfg = tomllib.loads(out)
-          assert cfg["lightning"]["lnd_grpc_host"] == "https://mostro_lnd:10001"
-          assert cfg["nostr"]["relays"] == ["ws://nostr_relay:8080"]
-          assert cfg["mostro"]["bitcoin_price_api_url"] == "http://127.0.0.1:9"
-          assert cfg["mostro"]["dev_fee_enabled"] is False
-          assert "price" not in cfg
-          assert cfg["nostr"]["nsec_privkey"].startswith("nsec1")
-          open(os.path.join(rt, "settings.toml"), "w", encoding="utf-8").write(out)
-          print("daemon settings written and parsed")
-          PY
-      - name: Install daemon settings and LND credentials into named volume
-        working-directory: mostro-regtest
-        run: |
-          set +x
-          set -euo pipefail
-          umask 077
-          uid=$(docker run --rm --entrypoint id docker-mostro -u)
-          echo "container user uid: $uid"
-          docker volume create satonero-config >/dev/null
-          docker run --rm --user root --entrypoint sh \
-            -v satonero-config:/config \
-            -v mostro-regtest_mostro_lnd:/lnd:ro \
-            -v "$RUNNER_TEMP":/src:ro \
-            docker-mostro -c "set -e; mkdir -p /config/lnd; cp /src/settings.toml /config/settings.toml; cp /lnd/tls.cert /config/lnd/tls.cert; cp /lnd/data/chain/bitcoin/regtest/admin.macaroon /config/lnd/admin.macaroon; chmod 600 /config/settings.toml /config/lnd/admin.macaroon; chown -R $uid:$uid /config; ls -l /config /config/lnd"
-      - name: Start Satonero daemon (disposable, regtest network only)
-        working-directory: mostro-regtest
-        run: |
-          set +x
-          set -euo pipefail
-          docker network inspect mostro-regtest_default >/dev/null
-          docker run -d --name satonero-daemon --network mostro-regtest_default -v satonero-config:/config docker-mostro:latest >/dev/null
-          sleep 60
-          test "$(docker inspect -f '{{.State.Running}}' satonero-daemon)" = "true"
-          echo "daemon running after 60 s; restart count: $(docker inspect -f '{{.RestartCount}}' satonero-daemon)"
-      - name: Verify daemon LND identity matches mostro_lnd getinfo
-        working-directory: mostro-regtest
-        run: |
-          set +x
-          set -euo pipefail
-          lnd_id=$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 getinfo | jq -r .identity_pubkey)
-          echo "mostro_lnd identity_pubkey: $lnd_id"
-          daemon_id=""
-          for i in $(seq 1 30); do
-            daemon_id=$(docker logs satonero-daemon 2>&1 | grep -a "Recorded Lightning node identity" | grep -oE '[0-9a-f]{66}' | tail -1 || true)
-            [ -n "$daemon_id" ] && break
-            sleep 10
-          done
-          echo "daemon recorded identity: $daemon_id"
-          test -n "$daemon_id"
-          test "$daemon_id" = "$lnd_id"
-          if docker logs satonero-daemon 2>&1 | grep -a -E "No connection to LND|panic|REFUSING TO START"; then echo "FAIL: LND or startup error in daemon log"; exit 1; fi
-          echo "VERIFIED: daemon LND identity equals mostro_lnd identity"
-      - name: Relay query diagnostics (10 min poll, 20 s interval, no early exit on failure)
+          printf '%s' "$pub" > "$RUNNER_TEMP/ctl.pub"
+          nonce="p4e-$(date +%s%N)-$RANDOM"
+          printf '%s' "$nonce" > "$RUNNER_TEMP/ctl.nonce"
+          unset hex
+          echo "control author pubkey (public): $pub"
+          echo "control nonce (unique, public): $nonce"
+      - name: Positive control - publish one nak-signed event to local relay only
         working-directory: mostro-regtest
         run: |
           set +x
           set -uo pipefail
           umask 077
-          pub=$(cat "$RUNNER_TEMP/daemon.pub")
-          d="$RUNNER_TEMP/diag"
-          mkdir -p "$d"
-          ctl_hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
-          ctl_pub=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key public "$ctl_hex")
-          unset ctl_hex
-          echo "computed daemon pubkey (public): $pub"
-          echo "control author, random, expected no events (public): $ctl_pub"
-          q() {
+          d="$RUNNER_TEMP/pc"; mkdir -p "$d"
+          nonce=$(cat "$RUNNER_TEMP/ctl.nonce")
+          # key goes via stdin into the container and is exported as NOSTR_SECRET_KEY (nak reads it from env; verified in nak_main.go)
+          cat "$RUNNER_TEMP/ctl.hex" | docker compose exec -T nostr_relay sh -c 'read -r NOSTR_SECRET_KEY; export NOSTR_SECRET_KEY; exec nak event -k 1 -c "$0" --tag t=p4e-positive-control ws://localhost:8080' "$nonce" > "$d/publish.stdout" 2> "$d/publish.stderr"
+          echo $? > "$d/publish.rc"
+          echo "publish rc=$(cat "$d/publish.rc") stdout_bytes=$(wc -c < "$d/publish.stdout") stderr_lines=$(wc -l < "$d/publish.stderr")"
+          echo "-- publish stderr (first 10 lines):"; head -10 "$d/publish.stderr" | cut -c1-200
+          id=$(jq -r '.id // empty' "$d/publish.stdout" 2>/dev/null || true)
+          echo "event id (public): ${id:-<none>}"
+          echo "event pubkey (public): $(jq -r '.pubkey // empty' "$d/publish.stdout" 2>/dev/null || true)"
+          echo "event kind: $(jq -r '.kind // empty' "$d/publish.stdout" 2>/dev/null || true)  tags: $(jq -c '.tags // []' "$d/publish.stdout" 2>/dev/null || true)"
+          printf '%s' "$id" > "$RUNNER_TEMP/ctl.id"
+          test -n "$id" && [ "$(cat "$d/publish.rc")" = "0" ] || { echo "PUBLISH FAILED"; exit 1; }
+          echo "PUBLISH OK"
+      - name: Positive control - nak queries (by id, by author; verbose; rc/stdout/stderr per query)
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          umask 077
+          d="$RUNNER_TEMP/pc"
+          id=$(cat "$RUNNER_TEMP/ctl.id")
+          pub=$(cat "$RUNNER_TEMP/ctl.pub")
+          nq() {
             local name="$1"; shift
-            timeout 40 docker compose exec -T nostr_relay nak req "$@" ws://localhost:8080 > "$d/$name.out" 2> "$d/$name.err"
+            timeout 40 docker compose exec -T nostr_relay nak -v req "$@" ws://localhost:8080 > "$d/$name.out" 2> "$d/$name.err"
             echo $? > "$d/$name.rc"
+            echo "-- $name: rc=$(cat "$d/$name.rc") stdout_lines=$(wc -l < "$d/$name.out") stderr_lines=$(wc -l < "$d/$name.err")"
+            echo "   stderr:"; head -12 "$d/$name.err" | cut -c1-220 | sed 's/^/   | /'
           }
-          start=$(date +%s)
-          iter=0
-          while :; do
-            iter=$((iter + 1))
-            q unfiltered --limit 50
-            q author_any --author "$pub" --limit 50
-            q k38385 --kind 38385 --author "$pub" --limit 5
-            q k10002 --kind 10002 --author "$pub" --limit 5
-            q d_tag_38385 --kind 38385 --tag d="$pub" --limit 5
-            q control_empty --kind 38385 --author "$ctl_pub" --limit 5
-            counts=""
-            for n in unfiltered author_any k38385 k10002 d_tag_38385 control_empty; do
-              counts="$counts $n=lines$(wc -l < "$d/$n.out")/rc$(cat "$d/$n.rc")"
-            done
-            echo "iter=$iter elapsed=$(( $(date +%s) - start ))s$counts"
-            if [ -s "$d/k38385.out" ] && [ -s "$d/k10002.out" ]; then echo "both kind 38385 and kind 10002 returned"; break; fi
-            if [ $(( $(date +%s) - start )) -ge 600 ]; then echo "600 s window reached"; break; fi
-            sleep 20
-          done
-          echo "== nak stderr and exit status per query (first 5 lines of stderr) =="
-          for n in unfiltered author_any k38385 k10002 d_tag_38385 control_empty; do
-            echo "-- $n: rc=$(cat "$d/$n.rc") stderr_lines=$(wc -l < "$d/$n.err")"
-            head -5 "$d/$n.err" | cut -c1-220
-          done
-          echo "== author verification =="
-          authors_all=$(jq -r '.pubkey' "$d/unfiltered.out" 2>/dev/null | sort -u | sed '/^$/d')
-          echo "distinct authors in unfiltered results: $(echo "$authors_all" | sed '/^$/d' | wc -l)"
-          echo "$authors_all" | sed '/^$/d' | sed 's/^/  author: /'
-          if echo "$authors_all" | grep -qx "$pub"; then echo "AUTHOR CHECK: computed daemon pubkey present in unfiltered results"; else echo "AUTHOR CHECK: computed daemon pubkey NOT present in unfiltered results"; fi
-          echo "authors of kind 38385 events with d=computed pubkey: $(jq -r '.pubkey' "$d/d_tag_38385.out" 2>/dev/null | sort -u | tr '\n' ' ')"
-          echo "authors of kind 38385 events filtered by computed author: $(jq -r '.pubkey' "$d/k38385.out" 2>/dev/null | sort -u | tr '\n' ' ')"
-          echo "kind 38385 tag names (first event, if any): $(head -1 "$d/k38385.out" | jq -r '[.tags[][0]] | unique | join(" ")' 2>/dev/null || true)"
-          echo "kind 10002 r-tags (first event, if any): $(head -1 "$d/k10002.out" | jq -r '[.tags[] | select(.[0]=="r") | .[1]] | join(" ")' 2>/dev/null || true)"
-          if [ -s "$d/k38385.out" ] && [ -s "$d/k10002.out" ]; then echo "RESULT: 38385 and 10002 retrieved"; else echo "RESULT: 38385 and/or 10002 NOT retrieved"; fi
-      - name: Relay and daemon log capture (filtered, last 200 lines each; always)
+          for a in 1 2 3; do nq "by_id_try$a" --id "$id" --limit 5; sleep 5; done
+          for a in 1 2 3; do nq "by_author_try$a" --author "$pub" --limit 20; sleep 5; done
+          echo "== stdout of last by_id try (events, if any) =="
+          cut -c1-400 "$d/by_id_try3.out" || true
+          echo "== stdout of last by_author try (event ids, if any) =="
+          jq -r '.id' "$d/by_author_try3.out" 2>/dev/null || true
+          echo "by_id events returned (try1..3): $(wc -l < "$d/by_id_try1.out") $(wc -l < "$d/by_id_try2.out") $(wc -l < "$d/by_id_try3.out")"
+          echo "by_author events returned (try1..3): $(wc -l < "$d/by_author_try1.out") $(wc -l < "$d/by_author_try2.out") $(wc -l < "$d/by_author_try3.out")"
+      - name: Positive control - independent WebSocket REQ/EOSE client (python stdlib, runner host port 8080)
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          cat > "$RUNNER_TEMP/wsclient.py" <<'PY'
+          import base64, json, os, socket, struct, sys
+
+          def recv_exact(s, n):
+              buf = b""
+              while len(buf) < n:
+                  chunk = s.recv(n - len(buf))
+                  if not chunk:
+                      raise ConnectionError("socket closed")
+                  buf += chunk
+              return buf
+
+          def ws_connect(host, port):
+              s = socket.create_connection((host, port), timeout=15)
+              key = base64.b64encode(os.urandom(16)).decode()
+              req = ("GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n") % (host, port, key)
+              s.sendall(req.encode())
+              head = b""
+              while b"\r\n\r\n" not in head:
+                  c = s.recv(1)
+                  if not c:
+                      raise ConnectionError("no handshake response")
+                  head += c
+              status = head.split(b"\r\n")[0].decode(errors="replace")
+              if " 101 " not in status:
+                  raise ConnectionError("handshake failed: " + status)
+              return s
+
+          def ws_send_text(s, text):
+              payload = text.encode()
+              mask = os.urandom(4)
+              n = len(payload)
+              hdr = bytearray([0x81])
+              if n < 126:
+                  hdr.append(0x80 | n)
+              elif n < 65536:
+                  hdr.append(0x80 | 126); hdr += struct.pack(">H", n)
+              else:
+                  hdr.append(0x80 | 127); hdr += struct.pack(">Q", n)
+              masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+              s.sendall(bytes(hdr) + mask + masked)
+
+          def ws_recv_frame(s):
+              b1, b2 = recv_exact(s, 2)
+              opcode = b1 & 0x0F
+              n = b2 & 0x7F
+              if n == 126:
+                  n = struct.unpack(">H", recv_exact(s, 2))[0]
+              elif n == 127:
+                  n = struct.unpack(">Q", recv_exact(s, 8))[0]
+              payload = recv_exact(s, n)
+              return opcode, payload
+
+          def run_req(s, subid, flt, timeout_s=10):
+              ws_send_text(s, json.dumps(["REQ", subid, flt]))
+              s.settimeout(timeout_s)
+              msgs = []
+              try:
+                  while True:
+                      opcode, payload = ws_recv_frame(s)
+                      if opcode == 0x9:  # ping -> pong
+                          continue
+                      if opcode == 0x8:
+                          msgs.append(("CLOSE_FRAME", ""))
+                          break
+                      if opcode != 0x1:
+                          continue
+                      text = payload.decode(errors="replace")
+                      try:
+                          m = json.loads(text)
+                      except Exception:
+                          msgs.append(("NONJSON", text[:120]))
+                          continue
+                      kind = m[0] if isinstance(m, list) and m else "?"
+                      if kind == "EVENT" and len(m) >= 3:
+                          ev = m[2]
+                          msgs.append(("EVENT", "id=%s kind=%s pubkey=%s" % (str(ev.get("id"))[:16], ev.get("kind"), str(ev.get("pubkey"))[:16])))
+                      else:
+                          msgs.append((str(kind), text[:160]))
+                      if kind in ("EOSE", "CLOSED"):
+                          break
+              except socket.timeout:
+                  msgs.append(("TIMEOUT", "no EOSE within %ds" % timeout_s))
+              ws_send_text(s, json.dumps(["CLOSE", subid]))
+              return msgs
+
+          if __name__ == "__main__":
+              event_id = sys.argv[1]
+              author = sys.argv[2]
+              s = ws_connect("127.0.0.1", 8080)
+              print("ws handshake: 101 OK")
+              for label, flt in (("by_id", {"ids": [event_id], "limit": 5}),
+                                 ("by_author", {"authors": [author], "limit": 20})):
+                  msgs = run_req(s, "pc-" + label, flt)
+                  evs = [m for m in msgs if m[0] == "EVENT"]
+                  print("%s: messages=%s events=%d" % (label, [m[0] for m in msgs], len(evs)))
+                  for m in msgs:
+                      print("   %s %s" % (m[0], m[1]))
+              s.close()
+          PY
+          id=$(cat "$RUNNER_TEMP/ctl.id")
+          pub=$(cat "$RUNNER_TEMP/ctl.pub")
+          python3 "$RUNNER_TEMP/wsclient.py" "$id" "$pub" > "$RUNNER_TEMP/pc/ws.txt" 2> "$RUNNER_TEMP/pc/ws.err" || echo "ws client exit=$?"
+          cat "$RUNNER_TEMP/pc/ws.txt" || true
+          echo "ws client stderr (first 5 lines):"; head -5 "$RUNNER_TEMP/pc/ws.err" || true
+      - name: Positive control - verdict summary (no secrets)
         if: always()
         working-directory: mostro-regtest
         run: |
           set +x
-          echo "== nostr_relay log lines (last 200, filtered) =="
-          docker compose logs --no-color --tail 200 nostr_relay 2>&1 | grep -a -i -E "event|notice|reject|error|connect|closed|invalid|subscri|req" | tail -200 || true
-          echo "== satonero-daemon log lines (filtered) =="
-          docker logs satonero-daemon 2>&1 | grep -a -i -E "relay|send|event|error|warn|connect|sending" | tail -200 || true
-      - name: Daemon diagnostics (always; filtered log lines only)
-        if: always()
-        working-directory: mostro-regtest
-        run: |
-          set +x
-          docker inspect --format 'daemon status={{.State.Status}} exitcode={{.State.ExitCode}} restarts={{.RestartCount}}' satonero-daemon || echo "daemon container not present"
-          docker logs satonero-daemon 2>&1 | grep -a -E "ERROR|WARN|REFUSING|panic|Recorded|relay|LND|price|Sending" | tail -150 || true
-      - name: Diagnostics for nostr_relay (only when unhealthy; no healthcheck changes)
-        if: always() && steps.health.outcome == 'failure'
-        working-directory: mostro-regtest
-        run: |
-          cid=$(docker compose ps -q nostr_relay)
-          echo "== docker inspect State.Health (nostr_relay) =="
-          docker inspect --format '{{json .State.Health}}' "$cid" || echo "inspect failed"
-          echo "== docker compose ps -a (nostr_relay) =="
-          docker compose ps -a nostr_relay || true
-          echo "== nostr_relay container logs (last 300 lines) =="
-          docker compose logs --no-color --tail 300 nostr_relay || true
-          echo "== nak relay nostr_relay:8080 =="
-          docker compose exec -T nostr_relay sh -c 'nak relay nostr_relay:8080; echo EXIT=$?' 2>&1 || true
-          echo "== nak relay http://nostr_relay:8080 =="
-          docker compose exec -T nostr_relay sh -c 'nak relay http://nostr_relay:8080; echo EXIT=$?' 2>&1 || true
-      - name: Disk and container summary
-        if: always()
-        working-directory: mostro-regtest
-        run: |
-          df -h /
-          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' || true
-          docker compose ps -a --format '{{.Service}} {{.State}} {{.Health}}' || true
+          d="$RUNNER_TEMP/pc"
+          id=$(cat "$RUNNER_TEMP/ctl.id" 2>/dev/null || echo "")
+          echo "published event id (public): ${id:-<none>}"
+          echo "nak by_id events (tries 1-3): $(wc -l < "$d/by_id_try1.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_id_try2.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_id_try3.out" 2>/dev/null || echo NA)"
+          echo "nak by_author events (tries 1-3): $(wc -l < "$d/by_author_try1.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_author_try2.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_author_try3.out" 2>/dev/null || echo NA)"
+          echo "nak rc by_id: $(cat "$d/by_id_try3.rc" 2>/dev/null || echo NA); nak rc by_author: $(cat "$d/by_author_try3.rc" 2>/dev/null || echo NA)"
+          echo "== relay log lines for control event and client connections (filtered, last 80) =="
+          docker compose logs --no-color --tail 400 nostr_relay 2>&1 | grep -a -i -E "persisted event|reject|invalid|NOTICE|CLOSED|subscri|REQ|EOSE|error" | tail -80 || true
       - name: Cleanup (always) with removal verification
         if: always()
         working-directory: mostro-regtest
         run: |
           set +x
-          docker rm -f satonero-daemon >/dev/null 2>&1 || true
-          docker volume rm satonero-config >/dev/null 2>&1 || true
-          rm -rf "$RUNNER_TEMP/diag" || true
-          rm -f "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/ev38385.jsonl" "$RUNNER_TEMP/ev10002.jsonl" || true
+          rm -rf "$RUNNER_TEMP/pc" || true
+          rm -f "$RUNNER_TEMP/ctl.hex" "$RUNNER_TEMP/ctl.pub" "$RUNNER_TEMP/ctl.nonce" "$RUNNER_TEMP/ctl.id" "$RUNNER_TEMP/wsclient.py" || true
           docker compose down -v || true
           docker system prune -af --volumes || true
           df -h /
           echo "== removal verification =="
-          echo "satonero-daemon containers left: [$(docker ps -a -q --filter name=satonero-daemon)]"
-          echo "satonero-config volumes left: [$(docker volume ls -q --filter name=satonero-config)]"
           echo "regtest containers left: [$(docker ps -a -q --filter name=mostro-regtest-)]"
           echo "regtest volumes left: [$(docker volume ls -q --filter name=mostro-regtest_)]"
-          if [ -z "$(docker ps -a -q --filter name=satonero-daemon)" ] && [ -z "$(docker volume ls -q --filter name=satonero-config)" ]; then echo "CLEANUP VERIFIED: daemon container and config volume removed"; else echo "CLEANUP NOT VERIFIED"; exit 1; fi
+          echo "credential files left: $(for f in ctl.hex ctl.pub ctl.nonce ctl.id wsclient.py; do test -e "$RUNNER_TEMP/$f" && echo -n "$f "; done)"
+          if [ -z "$(docker ps -a -q --filter name=mostro-regtest-)" ] && [ -z "$(docker volume ls -q --filter name=mostro-regtest_)" ] && ! test -e "$RUNNER_TEMP/ctl.hex"; then echo "CLEANUP VERIFIED: containers, volumes and temporary credentials removed"; else echo "CLEANUP NOT VERIFIED"; exit 1; fi
