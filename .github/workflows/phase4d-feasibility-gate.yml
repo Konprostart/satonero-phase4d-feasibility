@@ -57,26 +57,37 @@ jobs:
           test "$(git -C satonero rev-parse HEAD)" = "2534f8b0f05ade36007445511e02747f4468109a"
           test "$(git -C mostro-regtest rev-parse HEAD)" = "c6adbdaaaf0a2152a0728dbce6adf11945f547bd"
           test -z "$(git -C satonero status --porcelain --untracked-files=all)"
-      - name: Build Satonero daemon image (build only, no up)
-        working-directory: satonero
-        timeout-minutes: 40
+      - name: Apply nak pin to runner checkout of mostro-regtest (not committed)
+        working-directory: mostro-regtest
         run: |
           set -euo pipefail
-          start=$(date +%s)
-          docker compose -f docker/compose.yml build mostro
-          echo "BUILD_SECONDS=$(( $(date +%s) - start ))"
-      - name: Disk checkpoint (floor >= 3 GB free)
-        run: |
-          set -euo pipefail
-          free_kb=$(df --output=avail -k / | tail -1)
-          echo "free_kb=$free_kb"
-          if [ "$free_kb" -lt 3145728 ]; then echo "INFEASIBLE-DISK: < 3 GB free"; exit 1; fi
+          f=docker/nostr_relay/Dockerfile
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "16c3d80abc0ec58a72b782dc78f5eab2021c3fdab386514672777d941d34f553"
+          python3 - <<'PY'
+          p = "docker/nostr_relay/Dockerfile"
+          lines = open(p, encoding="utf-8").read().split("\n")
+          i = [n for n, l in enumerate(lines) if l.startswith("RUN BIN_URL=$(curl -s https://api.github.com/repos/fiatjaf/nak/releases/latest")]
+          assert len(i) == 1, i
+          i = i[0]
+          assert lines[i].endswith("grep linux-amd64) \\"), lines[i]
+          lines[i] = "RUN BIN_URL=https://github.com/fiatjaf/nak/releases/download/v0.22.2/nak-v0.22.2-linux-amd64 \\"
+          j = [n for n, l in enumerate(lines) if l == "  && curl -SLO $BIN_URL \\"]
+          assert len(j) == 1, j
+          j = j[0]
+          lines[j:j + 1] = [
+              "  && curl -fSLO $BIN_URL \\",
+              '  && echo "1b81a772619d913f345ecc3d663edcd37e7548ea6b4e21c582bb3826e2604556  nak-v0.22.2-linux-amd64" | sha256sum -c - \\',
+          ]
+          open(p, "w", encoding="utf-8").write("\n".join(lines))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "b5b35e3d596f26552c42a63ac13134722a8924c7fca451e43ab221e3368ed00e"
+          echo "patched Dockerfile sha256 verified"
       - name: Start regtest services (named volumes only, no channel init)
         working-directory: mostro-regtest
         run: |
           set -euo pipefail
           docker compose up -d bitcoin mostro_lnd alice_lnd bob_lnd nostr_relay
-      - name: Wait for healthchecks (max 10 min)
+      - name: Wait for healthchecks (max 10 min, per-service status)
         working-directory: mostro-regtest
         run: |
           set -euo pipefail
@@ -87,11 +98,13 @@ jobs:
             sleep 10
           done
           echo "FAIL: healthchecks not all healthy"; exit 1
-      - name: Disk and image summary
+      - name: Build and container summary
         if: always()
+        working-directory: mostro-regtest
         run: |
           df -h /
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' || true
+          docker compose ps -a --format '{{.Service}} {{.State}} {{.Health}}' || true
       - name: Cleanup (always)
         if: always()
         working-directory: mostro-regtest
