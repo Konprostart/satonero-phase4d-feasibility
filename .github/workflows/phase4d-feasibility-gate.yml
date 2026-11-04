@@ -168,7 +168,7 @@ jobs:
           d="$RUNNER_TEMP/pc"; mkdir -p "$d"
           nonce=$(cat "$RUNNER_TEMP/ctl.nonce")
           pub=$(cat "$RUNNER_TEMP/ctl.pub")
-          timeout 60 docker compose exec -T nostr_relay sh -c 'set +x; umask 077; export NOSTR_SECRET_KEY="$(cat /tmp/ctl.hex)"; rm -f /tmp/ctl.hex; test -n "$NOSTR_SECRET_KEY" && exec nak -v event -k 1 -c "$0" --tag t=p4e-positive-control ws://localhost:8080' "$nonce" > "$d/publish.stdout" 2> "$d/publish.stderr"
+          timeout 60 docker compose exec -T nostr_relay sh -c 'set +x; umask 077; export NOSTR_SECRET_KEY="$(cat /tmp/ctl.hex)"; rm -f /tmp/ctl.hex; test -n "$NOSTR_SECRET_KEY" && exec nak -v event -k 1 -c "$0" --tag t=p4e-positive-control ws://localhost:8080 < /dev/null' "$nonce" > "$d/publish.stdout" 2> "$d/publish.stderr"
           rc=$?
           echo "publish exit status: $rc"
           echo "publish stdout bytes: $(wc -c < "$d/publish.stdout")  stderr lines: $(wc -l < "$d/publish.stderr")"
