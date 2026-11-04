@@ -129,22 +129,37 @@ jobs:
             sleep 10
           done
           echo "FAIL: healthchecks not all healthy"; exit 1
-      - name: Positive control - generate disposable control key (runner temp, no tracing)
+      - name: Positive control - generate disposable key (runner temp only, no tracing)
         working-directory: mostro-regtest
         run: |
           set +x
           set -euo pipefail
           umask 077
           hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
-          printf '%s' "$hex" > "$RUNNER_TEMP/ctl.hex"
           pub=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key public "$hex")
+          printf '%s' "$hex" > "$RUNNER_TEMP/ctl.hex"
           printf '%s' "$pub" > "$RUNNER_TEMP/ctl.pub"
+          chmod 600 "$RUNNER_TEMP/ctl.hex"
           nonce="p4e-$(date +%s%N)-$RANDOM"
           printf '%s' "$nonce" > "$RUNNER_TEMP/ctl.nonce"
           unset hex
-          echo "control author pubkey (public): $pub"
-          echo "control nonce (unique, public): $nonce"
-      - name: Positive control - publish one nak-signed event to local relay only
+          echo "fresh control pubkey (public): $pub"
+          echo "NOTE: 094cba56... cannot be matched: its private key was generated in an earlier run and deleted."
+          echo "control nonce (public): $nonce"
+      - name: Positive control - transfer key via docker cp, verify, load into NOSTR_SECRET_KEY, remove file
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          cid=$(docker compose ps -q nostr_relay)
+          test -n "$cid"
+          docker cp "$RUNNER_TEMP/ctl.hex" "$cid:/tmp/ctl.hex"
+          rm -f "$RUNNER_TEMP/ctl.hex"
+          test ! -e "$RUNNER_TEMP/ctl.hex"
+          docker exec "$cid" sh -c 'chmod 600 /tmp/ctl.hex && test -s /tmp/ctl.hex && echo "key file in container: present, mode $(stat -c %a /tmp/ctl.hex), length $(wc -c < /tmp/ctl.hex) chars"'
+          echo "runner-side key copy removed"
+      - name: Positive control - nak -v event publish to local relay (fail loudly on no event)
         working-directory: mostro-regtest
         run: |
           set +x
@@ -152,19 +167,30 @@ jobs:
           umask 077
           d="$RUNNER_TEMP/pc"; mkdir -p "$d"
           nonce=$(cat "$RUNNER_TEMP/ctl.nonce")
-          # key goes via stdin into the container and is exported as NOSTR_SECRET_KEY (nak reads it from env; verified in nak_main.go)
-          cat "$RUNNER_TEMP/ctl.hex" | docker compose exec -T nostr_relay sh -c 'read -r NOSTR_SECRET_KEY; export NOSTR_SECRET_KEY; exec nak event -k 1 -c "$0" --tag t=p4e-positive-control ws://localhost:8080' "$nonce" > "$d/publish.stdout" 2> "$d/publish.stderr"
-          echo $? > "$d/publish.rc"
-          echo "publish rc=$(cat "$d/publish.rc") stdout_bytes=$(wc -c < "$d/publish.stdout") stderr_lines=$(wc -l < "$d/publish.stderr")"
-          echo "-- publish stderr (first 10 lines):"; head -10 "$d/publish.stderr" | cut -c1-200
-          id=$(jq -r '.id // empty' "$d/publish.stdout" 2>/dev/null || true)
-          echo "event id (public): ${id:-<none>}"
-          echo "event pubkey (public): $(jq -r '.pubkey // empty' "$d/publish.stdout" 2>/dev/null || true)"
-          echo "event kind: $(jq -r '.kind // empty' "$d/publish.stdout" 2>/dev/null || true)  tags: $(jq -c '.tags // []' "$d/publish.stdout" 2>/dev/null || true)"
+          pub=$(cat "$RUNNER_TEMP/ctl.pub")
+          timeout 60 docker compose exec -T nostr_relay sh -c 'set +x; umask 077; export NOSTR_SECRET_KEY="$(cat /tmp/ctl.hex)"; rm -f /tmp/ctl.hex; test -n "$NOSTR_SECRET_KEY" && exec nak -v event -k 1 -c "$0" --tag t=p4e-positive-control ws://localhost:8080' "$nonce" > "$d/publish.stdout" 2> "$d/publish.stderr"
+          rc=$?
+          echo "publish exit status: $rc"
+          echo "publish stdout bytes: $(wc -c < "$d/publish.stdout")  stderr lines: $(wc -l < "$d/publish.stderr")"
+          echo "-- publish stderr (first 25 lines, verbose nak output):"
+          head -25 "$d/publish.stderr" | cut -c1-240
+          echo "-- key file removed inside container:"
+          docker compose exec -T nostr_relay sh -c 'test ! -e /tmp/ctl.hex && echo "absent"' || echo "CHECK FAILED"
+          if [ "$rc" != "0" ] || [ ! -s "$d/publish.stdout" ]; then echo "PUBLISH FAILED: no event JSON produced (rc=$rc)"; exit 1; fi
+          id=$(jq -r '.id // empty' "$d/publish.stdout")
+          got_pub=$(jq -r '.pubkey // empty' "$d/publish.stdout")
+          kind=$(jq -r '.kind // empty' "$d/publish.stdout")
+          content=$(jq -r '.content // empty' "$d/publish.stdout")
+          tagok=$(jq -r 'any(.tags[]; .[0]=="t" and .[1]=="p4e-positive-control")' "$d/publish.stdout")
+          echo "event id (public): $id"
+          echo "event pubkey (public): $got_pub"
+          echo "event kind: $kind; content matches nonce: $([ "$content" = "$nonce" ] && echo yes || echo no); tag ok: $tagok"
+          test "${#id}" = "64" || { echo "PUBLISH FAILED: no 64-char event id"; exit 1; }
+          test "$got_pub" = "$pub" || { echo "PUBLISH FAILED: event pubkey differs from generated pubkey"; exit 1; }
+          test "$kind" = "1" && test "$tagok" = "true" && test "$content" = "$nonce" || { echo "PUBLISH FAILED: event fields differ"; exit 1; }
           printf '%s' "$id" > "$RUNNER_TEMP/ctl.id"
-          test -n "$id" && [ "$(cat "$d/publish.rc")" = "0" ] || { echo "PUBLISH FAILED"; exit 1; }
-          echo "PUBLISH OK"
-      - name: Positive control - nak queries (by id, by author; verbose; rc/stdout/stderr per query)
+          echo "PUBLISH OK (event id stored in runner temp)"
+      - name: Positive control - nak -v req by id and by author (3 tries each; stderr and rc kept)
         working-directory: mostro-regtest
         run: |
           set +x
@@ -177,18 +203,14 @@ jobs:
             local name="$1"; shift
             timeout 40 docker compose exec -T nostr_relay nak -v req "$@" ws://localhost:8080 > "$d/$name.out" 2> "$d/$name.err"
             echo $? > "$d/$name.rc"
-            echo "-- $name: rc=$(cat "$d/$name.rc") stdout_lines=$(wc -l < "$d/$name.out") stderr_lines=$(wc -l < "$d/$name.err")"
-            echo "   stderr:"; head -12 "$d/$name.err" | cut -c1-220 | sed 's/^/   | /'
+            echo "-- $name: rc=$(cat "$d/$name.rc") event_lines=$(wc -l < "$d/$name.out") stderr_lines=$(wc -l < "$d/$name.err")"
+            head -8 "$d/$name.err" | cut -c1-220 | sed 's/^/   | /'
           }
           for a in 1 2 3; do nq "by_id_try$a" --id "$id" --limit 5; sleep 5; done
           for a in 1 2 3; do nq "by_author_try$a" --author "$pub" --limit 20; sleep 5; done
-          echo "== stdout of last by_id try (events, if any) =="
-          cut -c1-400 "$d/by_id_try3.out" || true
-          echo "== stdout of last by_author try (event ids, if any) =="
-          jq -r '.id' "$d/by_author_try3.out" 2>/dev/null || true
-          echo "by_id events returned (try1..3): $(wc -l < "$d/by_id_try1.out") $(wc -l < "$d/by_id_try2.out") $(wc -l < "$d/by_id_try3.out")"
-          echo "by_author events returned (try1..3): $(wc -l < "$d/by_author_try1.out") $(wc -l < "$d/by_author_try2.out") $(wc -l < "$d/by_author_try3.out")"
-      - name: Positive control - independent WebSocket REQ/EOSE client (python stdlib, runner host port 8080)
+          echo "nak by_id event ids (try3): $(jq -r '.id' "$d/by_id_try3.out" 2>/dev/null | tr '\n' ' ')"
+          echo "nak by_author event ids (try3): $(jq -r '.id' "$d/by_author_try3.out" 2>/dev/null | tr '\n' ' ')"
+      - name: Positive control - independent WebSocket REQ/EOSE client (python stdlib, host port 8080)
         working-directory: mostro-regtest
         run: |
           set +x
@@ -251,14 +273,14 @@ jobs:
           def run_req(s, subid, flt, timeout_s=10):
               ws_send_text(s, json.dumps(["REQ", subid, flt]))
               s.settimeout(timeout_s)
-              msgs = []
+              out = []
               try:
                   while True:
                       opcode, payload = ws_recv_frame(s)
-                      if opcode == 0x9:  # ping -> pong
+                      if opcode == 0x9:
                           continue
                       if opcode == 0x8:
-                          msgs.append(("CLOSE_FRAME", ""))
+                          out.append(("CLOSE_FRAME", "", "", ""))
                           break
                       if opcode != 0x1:
                           continue
@@ -266,53 +288,68 @@ jobs:
                       try:
                           m = json.loads(text)
                       except Exception:
-                          msgs.append(("NONJSON", text[:120]))
+                          out.append(("NONJSON", text[:120], "", ""))
                           continue
                       kind = m[0] if isinstance(m, list) and m else "?"
-                      if kind == "EVENT" and len(m) >= 3:
+                      if kind == "EVENT" and len(m) >= 3 and isinstance(m[2], dict):
                           ev = m[2]
-                          msgs.append(("EVENT", "id=%s kind=%s pubkey=%s" % (str(ev.get("id"))[:16], ev.get("kind"), str(ev.get("pubkey"))[:16])))
+                          out.append(("EVENT", str(ev.get("id")), str(ev.get("kind")), str(ev.get("pubkey"))))
                       else:
-                          msgs.append((str(kind), text[:160]))
+                          out.append((str(kind), text[:160], "", ""))
                       if kind in ("EOSE", "CLOSED"):
                           break
               except socket.timeout:
-                  msgs.append(("TIMEOUT", "no EOSE within %ds" % timeout_s))
+                  out.append(("TIMEOUT", "no EOSE within %ds" % timeout_s, "", ""))
               ws_send_text(s, json.dumps(["CLOSE", subid]))
-              return msgs
+              return out
 
           if __name__ == "__main__":
-              event_id = sys.argv[1]
-              author = sys.argv[2]
+              event_id, author = sys.argv[1], sys.argv[2]
               s = ws_connect("127.0.0.1", 8080)
               print("ws handshake: 101 OK")
               for label, flt in (("by_id", {"ids": [event_id], "limit": 5}),
                                  ("by_author", {"authors": [author], "limit": 20})):
                   msgs = run_req(s, "pc-" + label, flt)
-                  evs = [m for m in msgs if m[0] == "EVENT"]
-                  print("%s: messages=%s events=%d" % (label, [m[0] for m in msgs], len(evs)))
                   for m in msgs:
-                      print("   %s %s" % (m[0], m[1]))
+                      if m[0] == "EVENT":
+                          print("%s EVENT %s %s %s" % (label, m[1], m[2], m[3]))
+                      else:
+                          print("%s %s %s" % (label, m[0], m[1]))
               s.close()
           PY
           id=$(cat "$RUNNER_TEMP/ctl.id")
           pub=$(cat "$RUNNER_TEMP/ctl.pub")
-          python3 "$RUNNER_TEMP/wsclient.py" "$id" "$pub" > "$RUNNER_TEMP/pc/ws.txt" 2> "$RUNNER_TEMP/pc/ws.err" || echo "ws client exit=$?"
-          cat "$RUNNER_TEMP/pc/ws.txt" || true
-          echo "ws client stderr (first 5 lines):"; head -5 "$RUNNER_TEMP/pc/ws.err" || true
-      - name: Positive control - verdict summary (no secrets)
+          set +e
+          python3 "$RUNNER_TEMP/wsclient.py" "$id" "$pub" > "$RUNNER_TEMP/pc/ws.txt" 2> "$RUNNER_TEMP/pc/ws.err"
+          echo "ws client exit status: $?"
+          set -e
+          echo "-- ws client output:"; cat "$RUNNER_TEMP/pc/ws.txt" | cut -c1-200
+          echo "-- ws client stderr (first 5 lines):"; head -5 "$RUNNER_TEMP/pc/ws.err" || true
+      - name: Positive control - compare nak and independent client results
         if: always()
         working-directory: mostro-regtest
         run: |
           set +x
+          set -uo pipefail
           d="$RUNNER_TEMP/pc"
           id=$(cat "$RUNNER_TEMP/ctl.id" 2>/dev/null || echo "")
-          echo "published event id (public): ${id:-<none>}"
-          echo "nak by_id events (tries 1-3): $(wc -l < "$d/by_id_try1.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_id_try2.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_id_try3.out" 2>/dev/null || echo NA)"
-          echo "nak by_author events (tries 1-3): $(wc -l < "$d/by_author_try1.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_author_try2.out" 2>/dev/null || echo NA) $(wc -l < "$d/by_author_try3.out" 2>/dev/null || echo NA)"
-          echo "nak rc by_id: $(cat "$d/by_id_try3.rc" 2>/dev/null || echo NA); nak rc by_author: $(cat "$d/by_author_try3.rc" 2>/dev/null || echo NA)"
-          echo "== relay log lines for control event and client connections (filtered, last 80) =="
-          docker compose logs --no-color --tail 400 nostr_relay 2>&1 | grep -a -i -E "persisted event|reject|invalid|NOTICE|CLOSED|subscri|REQ|EOSE|error" | tail -80 || true
+          nak_id=$(jq -r '.id' "$d/by_id_try3.out" 2>/dev/null | sort -u | tr '\n' ' ')
+          nak_au=$(jq -r '.id' "$d/by_author_try3.out" 2>/dev/null | sort -u | tr '\n' ' ')
+          ws_id=$(awk '$1=="by_id" && $2=="EVENT"{print $3}' "$d/ws.txt" 2>/dev/null | sort -u | tr '\n' ' ')
+          ws_au=$(awk '$1=="by_author" && $2=="EVENT"{print $3}' "$d/ws.txt" 2>/dev/null | sort -u | tr '\n' ' ')
+          echo "published event id: ${id:-<none>}"
+          echo "by_id   nak=[$nak_id] ws=[$ws_id]"
+          echo "by_author nak=[$nak_au] ws=[$ws_au]"
+          [ "$nak_id" = "$ws_id" ] && echo "by_id: nak == ws" || echo "by_id: nak != ws"
+          [ "$nak_au" = "$ws_au" ] && echo "by_author: nak == ws" || echo "by_author: nak != ws"
+          echo "ws by_id EOSE/CLOSED/TIMEOUT: $(awk '$1=="by_id" && $2!="EVENT"{print $2}' "$d/ws.txt" 2>/dev/null | tr '\n' ' ')"
+          echo "ws by_author EOSE/CLOSED/TIMEOUT: $(awk '$1=="by_author" && $2!="EVENT"{print $2}' "$d/ws.txt" 2>/dev/null | tr '\n' ' ')"
+      - name: Positive control - relay log lines (filtered, always)
+        if: always()
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          docker compose logs --no-color --tail 400 nostr_relay 2>&1 | grep -a -i -E "persisted event|reject|invalid|NOTICE|CLOSED|subscri|error" | tail -60 || true
       - name: Cleanup (always) with removal verification
         if: always()
         working-directory: mostro-regtest
