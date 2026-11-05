@@ -199,12 +199,14 @@ jobs:
           d="$RUNNER_TEMP/pc"; mkdir -p "$d"
           id=$(cat "$RUNNER_TEMP/ctl.id")
           pub=$(cat "$RUNNER_TEMP/ctl.pub")
-          timeout 30 docker compose exec -T nostr_relay nak req --id "$id" --limit 5 < /dev/null > "$d/nak_id_filter.json" 2> "$d/nak_id_filter.err"; echo "nak id filter rc=$?"
-          timeout 30 docker compose exec -T nostr_relay nak req --author "$pub" --limit 20 < /dev/null > "$d/nak_author_filter.json" 2> "$d/nak_author_filter.err"; echo "nak author filter rc=$?"
+          timeout 30 docker compose exec -T nostr_relay sh -c 'exec nak req --id "$0" --limit 5 < /dev/null' "$id" > "$d/nak_id_filter.json" 2> "$d/nak_id_filter.err"; echo "nak id filter rc=$?"
+          timeout 30 docker compose exec -T nostr_relay sh -c 'exec nak req --author "$0" --limit 20 < /dev/null' "$pub" > "$d/nak_author_filter.json" 2> "$d/nak_author_filter.err"; echo "nak author filter rc=$?"
           echo "-- nak id filter stdout (raw):"; cat "$d/nak_id_filter.json"
           echo "-- nak id filter stderr:"; head -3 "$d/nak_id_filter.err"
           echo "-- nak author filter stdout (raw):"; cat "$d/nak_author_filter.json"
           echo "-- nak author filter stderr:"; head -3 "$d/nak_author_filter.err"
+          timeout 40 docker compose exec -T nostr_relay sh -c 'exec nak -v req --id "$0" --limit 5 ws://localhost:8080 < /dev/null' "$id" > "$d/nak_id_relay.out" 2> "$d/nak_id_relay.err"; echo "nak id relay query (stdin /dev/null in container) rc=$? events=$(wc -l < "$d/nak_id_relay.out")"; head -4 "$d/nak_id_relay.err" | cut -c1-200
+          timeout 40 docker compose exec -T nostr_relay sh -c 'exec nak -v req --author "$0" --limit 20 ws://localhost:8080 < /dev/null' "$pub" > "$d/nak_author_relay.out" 2> "$d/nak_author_relay.err"; echo "nak author relay query (stdin /dev/null in container) rc=$? events=$(wc -l < "$d/nak_author_relay.out")"; head -4 "$d/nak_author_relay.err" | cut -c1-200
       - name: Filter diagnostic - compare nak filters with python filters and replay nak filters over raw WebSocket
         working-directory: mostro-regtest
         run: |
