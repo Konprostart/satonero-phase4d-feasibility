@@ -274,70 +274,155 @@ jobs:
           unset hex
           echo "client trade pubkey (public): $pub"
           printf '%s' "$pub" > "$RUNNER_TEMP/cli.pub"
-      - name: Write client script (no secrets; key is supplied separately)
+      - name: Write container scripts (no secrets in these files)
         run: |
           set +x
           umask 077
-          cat > "$RUNNER_TEMP/client.sh" <<'SH'
+          cat > "$RUNNER_TEMP/exec1.sh" <<'SH'
           #!/bin/sh
+          # Runs INSIDE the relay container. No jq here, so JSON selection uses
+          # nak --jq (gojq). The client key lives only in NOSTR_SECRET_KEY.
+          # Args: DAEMON_PUB CLIENT_PUB
           set -u
           umask 077
           DAEMON="$1"
-          TPUB="$2"
+          CLI="$2"
+          E=/tmp/evidence
+          rm -rf "$E"; mkdir -p "$E"; chmod 700 "$E"
           export NOSTR_SECRET_KEY="$(cat /tmp/cli.hex)"
           rm -f /tmp/cli.hex
-          if [ -e /tmp/cli.hex ] || [ -z "$NOSTR_SECRET_KEY" ]; then echo "RESULT: FINAL=ERROR key load/removal failed"; exit 1; fi
-          echo "RESULT: key loaded and key file removed inside container"
+          if [ -e /tmp/cli.hex ] || [ -z "$NOSTR_SECRET_KEY" ]; then echo "FINAL=ERROR_KEY"; exit 1; fi
+          FINAL=PENDING
+          TSEND=$(date +%s)
+          TSTART=$((TSEND - 10))
           MSG='[{"order":{"version":2,"request_id":1,"action":"new-order","payload":{"order":{"kind":"sell","fiat_code":"USD","fiat_amount":10,"amount":1000,"payment_method":"BANK_TRANSFER","premium":0}}}},null,null]'
           CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
-          echo "RESULT: encrypt_rc=$? ciphertext_chars=${#CT}"
-          EV=$(nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null 2>/tmp/pub.err)
-          echo "RESULT: publish_rc=$? event_id=$(echo "$EV" | jq -r .id 2>/dev/null) event_pubkey=$(echo "$EV" | jq -r .pubkey 2>/dev/null)"
-          echo "RESULT: publish_stderr=$(tr '\n' ' ' < /tmp/pub.err | cut -c1-200)"
-          FINAL=INCONCLUSIVE; OID=""; GOT_ACK=0; GOT_ORDER=0
-          i=0
-          while [ $i -lt 15 ]; do
-            i=$((i+1))
-            nak req -k 14 -a "$DAEMON" -t p="$TPUB" ws://localhost:8080 < /dev/null > /tmp/ack.jsonl 2>/tmp/ack.err; ARC=$?
-            nak req -k 38383 -a "$DAEMON" ws://localhost:8080 < /dev/null > /tmp/ord.jsonl 2>/tmp/ord.err; ORC=$?
-            echo "RESULT: poll=$i ack_rc=$ARC ack_events=$(wc -l < /tmp/ack.jsonl) order38383_rc=$ORC order38383_events=$(wc -l < /tmp/ord.jsonl)"
-            if [ -s /tmp/ack.jsonl ] && [ -z "$OID" ]; then
-              while IFS= read -r line; do
-                ct=$(echo "$line" | jq -r .content)
-                pt=$(nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null 2>/tmp/dec.err)
-                echo "RESULT: ack_decrypt_rc=$? plaintext=$pt"
-                act=$(echo "$pt" | jq -r '.[0].order.action // empty' 2>/dev/null)
-                if [ "$act" = "new-order" ]; then
-                  OID=$(echo "$pt" | jq -r '.[0].order.id // empty' 2>/dev/null)
-                  GOT_ACK=1
-                  echo "RESULT: ack action=new-order order_id=$OID"
-                elif [ -n "$act" ]; then
-                  GOT_ACK=2
-                  echo "RESULT: ack action=$act (defined response, not a publication)"
-                fi
-              done < /tmp/ack.jsonl
-            fi
-            if [ -n "$OID" ] && [ -s /tmp/ord.jsonl ]; then
-              jq -c --arg id "$OID" 'select(any(.tags[]; .[0]=="d" and .[1]==$id))' /tmp/ord.jsonl > /tmp/match.jsonl
-              n=$(wc -l < /tmp/match.jsonl)
-              if [ "$n" -ge 1 ]; then
-                GOT_ORDER=1
-                echo "RESULT: 38383 with d=$OID: count=$n author=$(jq -r .pubkey /tmp/match.jsonl | head -1) kind=$(jq -r .kind /tmp/match.jsonl | head -1)"
-                echo "RESULT: 38383 tags (names): $(jq -r '[.tags[][0]] | unique | join(" ")' /tmp/match.jsonl | head -1)"
-                echo "RESULT: 38383 event_id=$(jq -r .id /tmp/match.jsonl | head -1)"
-              fi
-            fi
-            if [ "$GOT_ORDER" = "1" ] && [ "$GOT_ACK" = "1" ]; then FINAL=PASS; break; fi
-            if [ "$GOT_ACK" = "2" ]; then FINAL=CANTDO; break; fi
+          echo "encrypt_rc=$? ciphertext_chars=${#CT}"
+          nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null > /tmp/pub.out 2> /tmp/pub.err
+          echo "publish_rc=$?"
+          echo "publish_stderr=$(tr '\n' ' ' < /tmp/pub.err | cut -c1-200)"
+          # ACK window: 15 polls, 20 s apart (about 5 min). Candidates are kind 14,
+          # author = daemon, exactly one p tag equal to the client, created after
+          # the send time minus 10 s. An ACK is classified MISSING only when the
+          # window has ended. More than one distinct candidate at any poll = AMBIGUOUS.
+          EXPR="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$CLI\"]]) and .created_at>=$TSTART) | .id"
+          : > /tmp/seen.txt
+          polls=0
+          FINAL=WINDOW
+          while [ $polls -lt 15 ]; do
+            polls=$((polls+1))
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$CLI" --limit 50 --jq "$EXPR" --jq-raw ws://localhost:8080 < /dev/null > /tmp/cand.txt 2> /tmp/cand.err
+            PRC=$?
+            echo "ack_poll=$polls rc=$PRC"
+            if [ "$PRC" != "0" ]; then FINAL=QUERY_FAILED; break; fi
+            if grep -Evq '^[0-9a-f]{64}$' /tmp/cand.txt; then FINAL=QUERY_FAILED; break; fi
+            cat /tmp/cand.txt >> /tmp/seen.txt
+            n=$(sort -u /tmp/seen.txt | grep -c . || true)
+            if [ "$n" -gt 1 ]; then FINAL=AMBIGUOUS_ACK; break; fi
             sleep 20
           done
-          echo "RESULT: FINAL=$FINAL order_id=$OID ack=$GOT_ACK order38383=$GOT_ORDER"
-          rm -f /tmp/cli.hex /tmp/ack.jsonl /tmp/ord.jsonl /tmp/match.jsonl /tmp/*.err
-          test ! -e /tmp/cli.hex && echo "RESULT: container key file absent"
+          n=$(sort -u /tmp/seen.txt | grep -c . || true)
+          if [ "$FINAL" = "WINDOW" ]; then
+            if [ "$n" = "1" ]; then FINAL=SELECTED; elif [ "$n" = "0" ]; then FINAL=MISSING_ACK; else FINAL=AMBIGUOUS_ACK; fi
+          fi
+          echo "ack_window_polls=$polls distinct_candidates=$n window_result=$FINAL"
+          if [ "$FINAL" = "SELECTED" ]; then
+            ACKID=$(sort -u /tmp/seen.txt | grep . | head -1)
+            timeout 40 nak req --id "$ACKID" --limit 1 ws://localhost:8080 < /dev/null > $E/ack14.json 2> $E/ack14.req.stderr
+            echo $? > $E/ack14.req.rc
+            if [ "$(cat $E/ack14.req.rc)" != "0" ]; then FINAL=ACK_FETCH_FAIL; fi
+            if [ "$(grep -c . $E/ack14.json || true)" != "1" ]; then FINAL=ACK_FETCH_FAIL; fi
+            FETCHED_ID=$(timeout 40 nak req --id "$ACKID" --limit 1 --jq '.id' --jq-raw ws://localhost:8080 < /dev/null 2> /tmp/fid.err) || FETCHED_ID=""
+            if ! printf '%s\n' "$FETCHED_ID" | grep -Eq '^[0-9a-f]{64}$'; then FINAL=ACK_FETCH_FAIL; fi
+            if [ "$FETCHED_ID" != "$ACKID" ]; then FINAL=ACK_FETCH_FAIL; fi
+          fi
+          if [ "$FINAL" = "SELECTED" ]; then
+            nak verify "$(cat $E/ack14.json)" > $E/ack14.verify.stdout 2> $E/ack14.verify.stderr
+            echo $? > $E/ack14.verify.rc
+            if [ "$(cat $E/ack14.verify.rc)" != "0" ]; then FINAL=ACK_VERIFY_FAIL; fi
+          fi
+          touch $E/ack_decrypt.stdout $E/ack_decrypt.stderr
+          if [ "$FINAL" = "SELECTED" ]; then
+            timeout 40 nak req --id "$ACKID" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null > /tmp/ct.txt 2> /tmp/ct.err
+            CT2=$(cat /tmp/ct.txt)
+            if [ -z "$CT2" ]; then FINAL=CONTENT_MISSING; fi
+          fi
+          if [ "$FINAL" = "SELECTED" ]; then
+            nak decrypt --sender-pubkey "$DAEMON" "$CT2" < /dev/null > $E/ack_decrypt.stdout 2> $E/ack_decrypt.stderr
+            echo $? > $E/ack_decrypt.rc
+            if [ "$(cat $E/ack_decrypt.rc)" != "0" ]; then FINAL=DECRYPT_FAIL; fi
+          fi
+          # Key-match check: the client key must not appear in any evidence file.
+          # Result only; the key is never printed.
+          unset CT CT2 MSG
+          printf '%s\n' "$NOSTR_SECRET_KEY" > /tmp/keypat
+          if grep -R -F -q -f /tmp/keypat "$E"; then KM=true; else KM=false; fi
+          rm -f /tmp/keypat
+          unset NOSTR_SECRET_KEY
+          echo "client_key_match=$KM"
+          rm -f /tmp/pub.out /tmp/pub.err /tmp/cand.txt /tmp/cand.err /tmp/seen.txt /tmp/ct.txt /tmp/ct.err /tmp/fid.err
+          echo "FINAL=$FINAL"
           SH
-          chmod 700 "$RUNNER_TEMP/client.sh"
-          test -s "$RUNNER_TEMP/client.sh"
-      - name: Run single NewOrder client (kind 14 / NIP-44) and poll for ack and kind 38383
+          cat > "$RUNNER_TEMP/exec2.sh" <<'SH'
+          #!/bin/sh
+          # Runs INSIDE the relay container. No key material is available here.
+          # Args: DAEMON_PUB ORDER_UUID
+          set -u
+          umask 077
+          DAEMON="$1"
+          ORDER="$2"
+          E=/tmp/evidence
+          case "$ORDER" in
+            ????????-????-????-????-????????????) ;;
+            *) echo "FINAL=BAD_ORDER_ARG"; exit 1 ;;
+          esac
+          : > /tmp/o38seen.txt
+          polls=0
+          FINAL=WINDOW
+          # 38383 window: 15 polls, 20 s apart. Query by author and exact d tag.
+          while [ $polls -lt 15 ]; do
+            polls=$((polls+1))
+            timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 ws://localhost:8080 < /dev/null > /tmp/o38.txt 2> $E/order38383.req.stderr
+            PRC=$?
+            echo "e38383_poll=$polls rc=$PRC lines=$(grep -c . /tmp/o38.txt || true)"
+            if [ "$PRC" != "0" ]; then FINAL=QUERY_FAILED; break; fi
+            cat /tmp/o38.txt >> /tmp/o38seen.txt
+            n=$(sort -u /tmp/o38seen.txt | grep -c . || true)
+            if [ "$n" -gt 1 ]; then FINAL=AMBIGUOUS_38383; break; fi
+            sleep 20
+          done
+          n=$(sort -u /tmp/o38seen.txt | grep -c . || true)
+          if [ "$FINAL" = "WINDOW" ]; then
+            if [ "$n" = "1" ]; then FINAL=FOUND; elif [ "$n" = "0" ]; then FINAL=MISSING_38383; else FINAL=AMBIGUOUS_38383; fi
+          fi
+          if [ "$FINAL" = "FOUND" ]; then
+            sort -u /tmp/o38seen.txt > $E/order38383.json
+            nak verify "$(cat $E/order38383.json)" > $E/order38383.verify.stdout 2> $E/order38383.verify.stderr
+            echo $? > $E/order38383.verify.rc
+            # Negative control 1: content changed, original sig kept. Expect rc 123.
+            sed 's/"content":""/"content":"x"/' $E/order38383.json > /tmp/neg1.json
+            c1=$(grep -c '"content":"x"' /tmp/neg1.json || true)
+            nak verify "$(cat /tmp/neg1.json)" > $E/negative_control_content.stdout 2> $E/negative_control_content.stderr
+            echo $? > $E/negative_control_content.rc
+            # Negative control 2: sig first hex digit changed, id and content kept. Expect rc 123.
+            sig=$(grep -o '"sig":"[0-9a-f]*"' $E/order38383.json | cut -d'"' -f4)
+            c=$(printf '%s' "$sig" | cut -c1)
+            if [ "$c" = "0" ]; then r=1; else r=0; fi
+            newsig="$r$(printf '%s' "$sig" | cut -c2-)"
+            sed "s/\"sig\":\"$sig\"/\"sig\":\"$newsig\"/" $E/order38383.json > /tmp/neg2.json
+            c2=$(grep -c "\"sig\":\"$newsig\"" /tmp/neg2.json || true)
+            nak verify "$(cat /tmp/neg2.json)" > $E/negative_control_sig.stdout 2> $E/negative_control_sig.stderr
+            echo $? > $E/negative_control_sig.rc
+            echo "neg_control_content_substitutions=$c1 neg_control_sig_substitutions=$c2"
+            rm -f /tmp/neg1.json /tmp/neg2.json
+          fi
+          rm -f /tmp/o38.txt /tmp/o38seen.txt
+          echo "FINAL=$FINAL"
+          SH
+          chmod 700 "$RUNNER_TEMP/exec1.sh" "$RUNNER_TEMP/exec2.sh"
+          test -s "$RUNNER_TEMP/exec1.sh" && test -s "$RUNNER_TEMP/exec2.sh"
+          echo "container scripts written"
+      - name: Run NewOrder client in container (send, ACK window, verify, decrypt, key check)
         working-directory: mostro-regtest
         run: |
           set +x
@@ -347,26 +432,273 @@ jobs:
           test -n "$cid"
           docker cp "$RUNNER_TEMP/cli.hex" "$cid:/tmp/cli.hex"
           rm -f "$RUNNER_TEMP/cli.hex"
-          docker cp "$RUNNER_TEMP/client.sh" "$cid:/tmp/client.sh"
+          test ! -e "$RUNNER_TEMP/cli.hex"
+          docker cp "$RUNNER_TEMP/exec1.sh" "$cid:/tmp/exec1.sh"
           daemon_pub=$(cat "$RUNNER_TEMP/daemon.pub")
           cli_pub=$(cat "$RUNNER_TEMP/cli.pub")
-          timeout 420 docker compose exec -T nostr_relay sh /tmp/client.sh "$daemon_pub" "$cli_pub" > "$RUNNER_TEMP/client.out" 2> "$RUNNER_TEMP/client.err"
-          echo "client exec rc=$?"
-          cat "$RUNNER_TEMP/client.out"
-          echo "client stderr lines: $(wc -l < "$RUNNER_TEMP/client.err")"
-          docker compose exec -T nostr_relay rm -f /tmp/client.sh /tmp/cli.hex || true
-          docker compose exec -T nostr_relay sh -c 'test ! -e /tmp/cli.hex && test ! -e /tmp/client.sh && echo "container temp files absent"' || echo "CHECK FAILED"
-      - name: Verdict (PASS only if kind 38383 correlates to the ack order id)
+          timeout 900 docker compose exec -T nostr_relay sh /tmp/exec1.sh "$daemon_pub" "$cli_pub" > "$RUNNER_TEMP/exec1.out" 2> "$RUNNER_TEMP/exec1.err"
+          echo "exec1 rc=$?"
+          cat "$RUNNER_TEMP/exec1.out"
+          echo "exec1 stderr lines: $(wc -l < "$RUNNER_TEMP/exec1.err")"
+          rm -rf "$RUNNER_TEMP/evidence"
+          docker cp "$cid:/tmp/evidence" "$RUNNER_TEMP/"
+          test -d "$RUNNER_TEMP/evidence"
+          echo "evidence copied from container: $(ls "$RUNNER_TEMP/evidence" | wc -l) files"
+      - name: Read decrypted ACK, validate shape, derive ORDER (runner only; jq)
+        working-directory: mostro-regtest
         run: |
           set +x
-          f="$RUNNER_TEMP/client.out"
-          final=$(grep -a "RESULT: FINAL=" "$f" | tail -1 | sed 's/.*FINAL=//' | cut -d' ' -f1)
-          echo "VERDICT: ${final:-NONE}"
-          case "$final" in
-            PASS) echo "SUCCESS: kind 38383 published by daemon and correlated to submitted order" ;;
-            CANTDO) echo "DIAGNOSTIC ONLY: defined CantDo rejection, NOT a successful kind 38383 publication"; exit 1 ;;
-            *) echo "INCONCLUSIVE: no defined response and no kind 38383 correlation"; exit 1 ;;
-          esac
+          set -uo pipefail
+          E="$RUNNER_TEMP/evidence"
+          : > "$RUNNER_TEMP/shape.txt"
+          final=$({ grep -a "^FINAL=" "$RUNNER_TEMP/exec1.out" || true; } | tail -1 | cut -d= -f2)
+          echo "exec1_final=$final" >> "$RUNNER_TEMP/shape.txt"
+          if [ "$final" != "SELECTED" ] && [ "$final" != "DECRYPT_FAIL" ]; then
+            echo "shape=not_applicable" >> "$RUNNER_TEMP/shape.txt"
+          elif [ "$(cat $E/ack_decrypt.rc 2>/dev/null)" != "0" ]; then
+            echo "shape=decrypt_not_ok" >> "$RUNNER_TEMP/shape.txt"
+          else
+            if jq -e 'type=="array" and length==3 and .[1]==null and .[2]==null and (.[0]|type=="object") and ((.[0]|keys)==["order"]) and (.[0].order.action=="new-order") and (.[0].order.id|type=="string") and (.[0].order.payload.order.kind=="sell")' "$E/ack_decrypt.stdout" > /dev/null 2>&1; then
+              echo "shape=new_order_ok" >> "$RUNNER_TEMP/shape.txt"
+              jq -r '.[0].order.id' "$E/ack_decrypt.stdout" > "$RUNNER_TEMP/order.txt"
+            elif jq -e 'type=="array" and length==3 and (.[0]|type=="object") and ((.[0]|keys)==["cant-do"])' "$E/ack_decrypt.stdout" > /dev/null 2>&1; then
+              echo "shape=cant_do_diagnostic" >> "$RUNNER_TEMP/shape.txt"
+            else
+              echo "shape=unexpected_shape" >> "$RUNNER_TEMP/shape.txt"
+            fi
+          fi
+          cat "$RUNNER_TEMP/shape.txt"
+          if [ -s "$RUNNER_TEMP/order.txt" ]; then
+            ORDER=$(cat "$RUNNER_TEMP/order.txt")
+            logid=$(docker logs satonero-daemon 2>&1 | { grep -a "New order saved Id: $ORDER" || true; } | wc -l)
+            echo "order id matches daemon 'New order saved' log line: $([ "$logid" -ge 1 ] && echo true || echo false)"
+          fi
+      - name: Run 38383 lookup and verification in container (only for a validated new-order ACK)
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          if ! grep -q "^shape=new_order_ok" "$RUNNER_TEMP/shape.txt"; then
+            echo "skipped: no validated new-order ACK"; exit 0
+          fi
+          cid=$(docker compose ps -q nostr_relay)
+          docker cp "$RUNNER_TEMP/exec2.sh" "$cid:/tmp/exec2.sh"
+          ORDER=$(cat "$RUNNER_TEMP/order.txt")
+          daemon_pub=$(cat "$RUNNER_TEMP/daemon.pub")
+          timeout 600 docker compose exec -T nostr_relay sh /tmp/exec2.sh "$daemon_pub" "$ORDER" > "$RUNNER_TEMP/exec2.out" 2> "$RUNNER_TEMP/exec2.err"
+          echo "exec2 rc=$?"
+          cat "$RUNNER_TEMP/exec2.out"
+          docker cp "$cid:/tmp/evidence/." "$RUNNER_TEMP/evidence/"
+          ls "$RUNNER_TEMP/evidence" | wc -l
+      - name: C1 and ACK structural checks (runner; jq; public fields only)
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          E="$RUNNER_TEMP/evidence"
+          : > "$RUNNER_TEMP/c1.txt"
+          daemon_pub=$(cat "$RUNNER_TEMP/daemon.pub")
+          cli_pub=$(cat "$RUNNER_TEMP/cli.pub")
+          if [ -s "$RUNNER_TEMP/order.txt" ] && [ -s "$E/order38383.json" ]; then
+            ORDER=$(cat "$RUNNER_TEMP/order.txt")
+            lines=$(grep -c . "$E/order38383.json" || true)
+            echo "c1_single_line=$([ "$lines" = "1" ] && echo pass || echo fail)" >> "$RUNNER_TEMP/c1.txt"
+            if jq -e --arg d "$daemon_pub" --arg o "$ORDER" '.kind==38383 and .pubkey==$d and ([.tags[]|select(.[0]=="d")]==[["d",$o]])' "$E/order38383.json" > /dev/null; then
+              echo "c1_kind_author_exact_d_tag=pass" >> "$RUNNER_TEMP/c1.txt"
+            else
+              echo "c1_kind_author_exact_d_tag=fail" >> "$RUNNER_TEMP/c1.txt"
+            fi
+            logeid=$(docker logs satonero-daemon 2>&1 | { grep -a "Publishing Event Id" || true; } | { grep -a "$ORDER" || true; } | { grep -oE 'Event Id: [0-9a-f]{64}' || true; } | tail -1 | cut -d' ' -f3)
+            evid=$(jq -r .id "$E/order38383.json")
+            if [ -n "$logeid" ] && [ "$logeid" = "$evid" ]; then
+              echo "c1_event_id_matches_publish_log=pass" >> "$RUNNER_TEMP/c1.txt"
+            else
+              echo "c1_event_id_matches_publish_log=fail" >> "$RUNNER_TEMP/c1.txt"
+            fi
+            echo "c1_signature_verify_rc=$(cat $E/order38383.verify.rc 2>/dev/null || echo missing)" >> "$RUNNER_TEMP/c1.txt"
+            echo "c1_neg_content_rc=$(cat $E/negative_control_content.rc 2>/dev/null || echo missing)" >> "$RUNNER_TEMP/c1.txt"
+            echo "c1_neg_sig_rc=$(cat $E/negative_control_sig.rc 2>/dev/null || echo missing)" >> "$RUNNER_TEMP/c1.txt"
+          else
+            echo "c1_not_evaluated=true" >> "$RUNNER_TEMP/c1.txt"
+          fi
+          if [ -s "$E/ack14.json" ]; then
+            lines=$(grep -c . "$E/ack14.json" || true)
+            if [ "$lines" = "1" ] && jq -e --arg d "$daemon_pub" --arg c "$cli_pub" '.kind==14 and .pubkey==$d and ([.tags[]|select(.[0]=="p")]==[["p",$c]])' "$E/ack14.json" > /dev/null; then
+              echo "ack_kind_author_p_tag=pass" >> "$RUNNER_TEMP/c1.txt"
+            else
+              echo "ack_kind_author_p_tag=fail" >> "$RUNNER_TEMP/c1.txt"
+            fi
+          fi
+          cat "$RUNNER_TEMP/c1.txt"
+      - name: Manifest (public values only; no key material)
+        run: |
+          set +x
+          E="$RUNNER_TEMP/evidence"
+          mkdir -p "$E"
+          {
+            echo "run_id=${GITHUB_RUN_ID:-unknown}"
+            echo "utc=$(date -u +%FT%TZ)"
+            echo "daemon_pubkey=$(cat "$RUNNER_TEMP/daemon.pub")"
+            echo "client_pubkey=$(cat "$RUNNER_TEMP/cli.pub")"
+            echo "order_id=$(cat "$RUNNER_TEMP/order.txt" 2>/dev/null || echo none)"
+            echo "pins=satonero:2534f8b0f05ade36007445511e02747f4468109a mostro-regtest:c6adbdaaaf0a2152a0728dbce6adf11945f547bd nak:v0.22.2"
+            echo "order_limit=1 retries=0 payments=0 channels=0"
+          } > "$E/manifest.txt"
+          cat "$E/manifest.txt"
+      - name: Secret gate (results only; any failure = no artifact upload)
+        id: gate
+        run: |
+          set +x
+          set -uo pipefail
+          E="$RUNNER_TEMP/evidence"
+          OUT="$RUNNER_TEMP/secret_gate.txt"
+          : > "$OUT"
+          # 1. Client key exact match (computed in container, result only)
+          km=$({ grep -a "^client_key_match=" "$RUNNER_TEMP/exec1.out" || true; } | tail -1 | cut -d= -f2)
+          if [ "$km" = "false" ]; then r=pass; else r=fail; fi
+          echo "check=client_key_exact_match result=$r count=$([ "$km" = "false" ] && echo 0 || echo 1)" >> "$OUT"
+          # 2. Daemon nsec exact match (pattern read from file, never from argv)
+          if [ ! -s "$RUNNER_TEMP/daemon.nsec" ]; then n=1; r=fail; elif grep -R -F -q -f "$RUNNER_TEMP/daemon.nsec" "$E"; then n=1; r=fail; else n=0; r=pass; fi
+          echo "check=daemon_nsec_exact_match result=$r count=$n" >> "$OUT"
+          # 3. Textual secret patterns (file counts only)
+          pat='nsec1|ncryptsec|BEGIN [A-Z ]*PRIVATE|macaroon|cli\.hex|daemon\.nsec|AgE[A-Za-z0-9+/]{40,}'
+          n=$({ grep -R -E -i -l -- "$pat" "$E" || true; } | wc -l)
+          if [ "$n" = "0" ]; then r=pass; else r=fail; fi
+          echo "check=secret_pattern_files result=$r count=$n" >> "$OUT"
+          # 4. Hex-run allowlist on JSON artifacts and parsed plaintext (python; counts only)
+          PY_RC=0
+          python3 - "$E" "$OUT" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/cli.pub" <<'PY' || PY_RC=$?
+          import json, os, re, sys
+          E, OUT = sys.argv[1], sys.argv[2]
+          DAEMON_PUB = open(sys.argv[3]).read().strip().lower()
+          CLIENT_PUB = open(sys.argv[4]).read().strip().lower()
+          HEX = re.compile(r'[0-9a-fA-F]+')
+          def load(name):
+              p = os.path.join(E, name)
+              if not os.path.exists(p) or os.path.getsize(p) == 0:
+                  return None
+              return open(p, encoding='utf-8', errors='replace').read()
+          ids, sigs = {DAEMON_PUB, CLIENT_PUB}, set()
+          texts = []
+          for name, strip_content in (('order38383.json', False), ('ack14.json', True)):
+              raw = load(name)
+              if raw is None:
+                  continue
+              for line in raw.splitlines():
+                  if not line.strip():
+                      continue
+                  ev = json.loads(line)
+                  ids.add(ev['id']); ids.add(ev['pubkey']); sigs.add(ev['sig'])
+                  if strip_content:
+                      ev = dict(ev); ev.pop('content', None)
+                  texts.append((name, json.dumps(ev, sort_keys=True)))
+          pt = load('ack_decrypt.stdout')
+          if pt:
+              try:
+                  arr = json.loads(pt)
+                  texts.append(('ack_decrypt.stdout', json.dumps(arr[0], sort_keys=True)))
+              except Exception:
+                  texts.append(('ack_decrypt.stdout', pt))
+          violations = 0
+          for name, t in texts:
+              for m in HEX.finditer(t):
+                  run = m.group(0)
+                  L = len(run)
+                  if L < 32:
+                      continue
+                  if L == 64 and run.lower() in {x.lower() for x in ids}:
+                      continue
+                  if L == 128 and run.lower() in {x.lower() for x in sigs}:
+                      continue
+                  violations += 1
+          r = 'pass' if violations == 0 else 'fail'
+          with open(OUT, 'a') as fh:
+              fh.write('check=hex_run_allowlist result=%s count=%d\n' % (r, violations))
+          PY
+          # 5. Plaintext shape (decided earlier by the runner)
+          if grep -q "^shape=new_order_ok" "$RUNNER_TEMP/shape.txt" || grep -q "^shape=not_applicable" "$RUNNER_TEMP/shape.txt" || grep -q "^shape=decrypt_not_ok" "$RUNNER_TEMP/shape.txt" || grep -q "^shape=cant_do_diagnostic" "$RUNNER_TEMP/shape.txt"; then r=pass; else r=fail; fi
+          echo "check=plaintext_shape_gate result=$r count=$([ $r = pass ] && echo 0 || echo 1)" >> "$OUT"
+          # 6. Allowed evidence file names only
+          bad=$(ls "$E" | { grep -v -E '^(manifest\.txt|order38383\.(json|verify\.(stdout|stderr|rc)|req\.stderr)|ack14\.(json|req\.(stderr|rc)|verify\.(stdout|stderr|rc))|ack_decrypt\.(stdout|stderr|rc)|negative_control_(content|sig)\.(stdout|stderr|rc))$' || true; } | wc -l)
+          if [ "$bad" = "0" ]; then r=pass; else r=fail; fi
+          echo "check=unexpected_file_names result=$r count=$bad" >> "$OUT"
+          cat "$OUT"
+          gate_ok=1
+          [ "${PY_RC:-1}" = "0" ] || { echo "python hex check exit code: ${PY_RC:-unset}"; gate_ok=0; }
+          for name in client_key_exact_match daemon_nsec_exact_match secret_pattern_files hex_run_allowlist plaintext_shape_gate unexpected_file_names; do
+            if grep -q "^check=$name result=pass count=[0-9][0-9]*$" "$OUT"; then :; else echo "not passed: $name"; gate_ok=0; fi
+          done
+          [ "$(grep -c '^check=' "$OUT")" = "6" ] || { echo "unexpected number of check lines"; gate_ok=0; }
+          if [ "$gate_ok" = "1" ]; then
+            echo "gate=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=fail" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload policy (R7; results only)
+        id: policy
+        env:
+          GATE_RESULT: ${{ steps.gate.outputs.gate }}
+        run: |
+          set +x
+          set -uo pipefail
+          P="$RUNNER_TEMP"
+          f1=$({ grep -a "^FINAL=" "$P/exec1.out" 2>/dev/null || true; } | tail -1 | cut -d= -f2)
+          f2=$({ grep -a "^FINAL=" "$P/exec2.out" 2>/dev/null || true; } | tail -1 | cut -d= -f2)
+          sh_state=$({ grep -a "^shape=" "$P/shape.txt" 2>/dev/null || true; } | tail -1 | cut -d= -f2)
+          upload=no
+          reason=none
+          if [ "${GATE_RESULT:-}" != "pass" ]; then
+            reason=secret_gate_not_passed
+          elif [ "$f1" = "SELECTED" ] && [ "$f2" = "FOUND" ] && [ "$sh_state" = "new_order_ok" ]; then
+            upload=yes; reason=success_path
+          elif [ "$f1" = "QUERY_FAILED" ] || [ "$f2" = "QUERY_FAILED" ] || [ "$f1" = "ACK_FETCH_FAIL" ] || [ "$f1" = "MISSING_ACK" ] || [ "$f1" = "DECRYPT_FAIL" ]; then
+            upload=yes; reason=diagnostic_R7
+          else
+            reason=state_not_in_upload_policy
+          fi
+          echo "upload=$upload" >> "$GITHUB_OUTPUT"
+          echo "policy: upload=$upload reason=$reason exec1=${f1:-none} exec2=${f2:-none} shape=${sh_state:-none} gate=${GATE_RESULT:-none}"
+      - name: Upload evidence artifact (only if the upload policy allows it; gate must pass)
+        if: steps.policy.outputs.upload == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4f-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 1
+          if-no-files-found: error
+      - name: Verdict (strict; PASS only if every condition holds)
+        if: always()
+        run: |
+          set +x
+          fin=$(grep -a "^FINAL=" "$RUNNER_TEMP/exec1.out" 2>/dev/null | tail -1 | cut -d= -f2)
+          sh_state=$(grep -a "^shape=" "$RUNNER_TEMP/shape.txt" 2>/dev/null | tail -1 | cut -d= -f2)
+          fin2=$(grep -a "^FINAL=" "$RUNNER_TEMP/exec2.out" 2>/dev/null | tail -1 | cut -d= -f2)
+          gate=$(grep -a "gate=" "$GITHUB_OUTPUT" 2>/dev/null | tail -1 | cut -d= -f2)
+          echo "exec1=${fin:-none} shape=${sh_state:-none} exec2=${fin2:-none} secret_gate=${gate:-none}"
+          c1=$(cat "$RUNNER_TEMP/c1.txt" 2>/dev/null)
+          echo "$c1" | grep -q "fail" && c1ok=no || c1ok=yes
+          echo "$c1" | grep -q "^c1_kind_author_exact_d_tag=pass" && echo "$c1" | grep -q "^c1_event_id_matches_publish_log=pass" && echo "$c1" | grep -q "^c1_signature_verify_rc=0" && echo "$c1" | grep -q "^c1_neg_content_rc=123" && echo "$c1" | grep -q "^c1_neg_sig_rc=123" && c1full=yes || c1full=no
+          if [ "$sh_state" = "cant_do_diagnostic" ]; then
+            echo "DIAGNOSTIC ONLY: defined CantDo ACK. NOT a successful kind 38383 publication."; exit 1
+          fi
+          if [ "$fin" = "QUERY_FAILED" ] || [ "$fin" = "ACK_FETCH_FAIL" ]; then
+            echo "INCONCLUSIVE: ACK query/fetch failed ($fin); no decrypt attempted"; exit 1
+          fi
+          if [ "$fin" = "MISSING_ACK" ] || [ "$fin" = "AMBIGUOUS_ACK" ]; then
+            echo "INCONCLUSIVE: ACK window result $fin (no decrypt attempted)"; exit 1
+          fi
+          if [ "$gate" != "pass" ]; then
+            echo "FAIL: secret gate did not pass; no artifact uploaded"; exit 1
+          fi
+          if [ "$fin" = "SELECTED" ] || [ "$fin" = "DECRYPT_FAIL" ]; then
+            if [ "$sh_state" = "new_order_ok" ] && [ "$fin2" = "FOUND" ] && [ "$c1ok" = "yes" ] && [ "$c1full" = "yes" ]; then
+              echo "SUCCESS: kind 38383 published by daemon, exact d tag = order id, signature verified, negative controls rejected, ACK validated and decrypted."; exit 0
+            fi
+          fi
+          if [ "$fin2" = "QUERY_FAILED" ]; then
+            echo "INCONCLUSIVE: 38383 query failed; no artifact-based success"; exit 1
+          fi
+          echo "INCONCLUSIVE/FAIL: exec1=$fin shape=$sh_state exec2=$fin2 c1=$c1full"; exit 1
       - name: Daemon and relay log capture (filtered; always)
         if: always()
         working-directory: mostro-regtest
@@ -380,10 +712,14 @@ jobs:
         working-directory: mostro-regtest
         run: |
           set +x
+          cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
+          if [ -n "$cid" ]; then
+            docker exec "$cid" sh -c 'rm -rf /tmp/evidence /tmp/exec1.sh /tmp/exec2.sh /tmp/cli.hex /tmp/keypat /tmp/pub.out /tmp/cand.txt /tmp/seen.txt /tmp/ct.txt /tmp/o38seen.txt /tmp/neg1.json /tmp/neg2.json' || true
+          fi
+          rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/cli.hex" "$RUNNER_TEMP/exec1.sh" "$RUNNER_TEMP/exec2.sh" "$RUNNER_TEMP/exec1.out" "$RUNNER_TEMP/exec1.err" "$RUNNER_TEMP/exec2.out" "$RUNNER_TEMP/exec2.err" "$RUNNER_TEMP/order.txt" "$RUNNER_TEMP/shape.txt" "$RUNNER_TEMP/c1.txt" "$RUNNER_TEMP/secret_gate.txt" || true
           docker rm -f satonero-daemon >/dev/null 2>&1 || true
           docker volume rm satonero-config >/dev/null 2>&1 || true
-          rm -rf "$RUNNER_TEMP/diag" || true; rm -f "$RUNNER_TEMP/cli.hex" "$RUNNER_TEMP/client.sh" "$RUNNER_TEMP/client.out" "$RUNNER_TEMP/client.err" "$RUNNER_TEMP/synced_at" || true
-          rm -f "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/ev38385.jsonl" "$RUNNER_TEMP/ev10002.jsonl" || true
+          rm -f "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/synced_at" || true
           docker compose down -v || true
           docker system prune -af --volumes || true
           df -h /
@@ -392,4 +728,7 @@ jobs:
           echo "satonero-config volumes left: [$(docker volume ls -q --filter name=satonero-config)]"
           echo "regtest containers left: [$(docker ps -a -q --filter name=mostro-regtest-)]"
           echo "regtest volumes left: [$(docker volume ls -q --filter name=mostro-regtest_)]"
-          if [ -z "$(docker ps -a -q --filter name=satonero-daemon)" ] && [ -z "$(docker volume ls -q --filter name=satonero-config)" ]; then echo "CLEANUP VERIFIED: daemon container and config volume removed"; else echo "CLEANUP NOT VERIFIED"; exit 1; fi
+          left=""
+          for f in daemon.nsec cli.hex exec1.sh exec2.sh evidence; do test -e "$RUNNER_TEMP/$f" && left="$left $f"; done
+          echo "runner temp credential/evidence files left:[$left]"
+          if [ -z "$(docker ps -a -q --filter name=satonero-daemon)" ] && [ -z "$(docker volume ls -q --filter name=satonero-config)" ] && [ -z "$(docker ps -a -q --filter name=mostro-regtest-)" ] && [ -z "$(docker volume ls -q --filter name=mostro-regtest_)" ] && [ -z "$left" ]; then echo "CLEANUP VERIFIED"; else echo "CLEANUP NOT VERIFIED"; exit 1; fi
