@@ -224,122 +224,157 @@ jobs:
           test "$daemon_id" = "$lnd_id"
           if docker logs satonero-daemon 2>&1 | grep -a -E "No connection to LND|panic|REFUSING TO START"; then echo "FAIL: LND or startup error in daemon log"; exit 1; fi
           echo "VERIFIED: daemon LND identity equals mostro_lnd identity"
-      - name: Relay query diagnostics (10 min poll, 20 s interval, no early exit on failure)
+      - name: Mine exactly 150 regtest blocks with the dev wallet (no funding, no channels)
         working-directory: mostro-regtest
         run: |
           set +x
-          set -uo pipefail
-          umask 077
-          pub=$(cat "$RUNNER_TEMP/daemon.pub")
-          d="$RUNNER_TEMP/diag"
-          mkdir -p "$d"
-          ctl_hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
-          ctl_pub=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key public "$ctl_hex")
-          unset ctl_hex
-          echo "computed daemon pubkey (public): $pub"
-          echo "control author, random, expected no events (public): $ctl_pub"
-          q() {
-            local name="$1"; shift
-            timeout 40 docker compose exec -T nostr_relay sh -c 'exec nak -v req "$@" ws://localhost:8080 < /dev/null' nak "$@" > "$d/$name.out" 2> "$d/$name.err"
-            echo $? > "$d/$name.rc"
-          }
-          start=$(date +%s)
-          iter=0
-          while :; do
-            iter=$((iter + 1))
-            q unfiltered --limit 50
-            q author_any --author "$pub" --limit 50
-            q k38385 --kind 38385 --author "$pub" --limit 5
-            q k10002 --kind 10002 --author "$pub" --limit 5
-            q d_tag_38385 --kind 38385 --tag d="$pub" --limit 5
-            q control_empty --kind 38385 --author "$ctl_pub" --limit 5
-            counts=""
-            for n in unfiltered author_any k38385 k10002 d_tag_38385 control_empty; do
-              counts="$counts $n=lines$(wc -l < "$d/$n.out")/rc$(cat "$d/$n.rc")"
-            done
-            echo "iter=$iter elapsed=$(( $(date +%s) - start ))s$counts"
-            if [ -s "$d/k38385.out" ] && [ -s "$d/k10002.out" ]; then echo "both kind 38385 and kind 10002 returned"; break; fi
-            if [ $(( $(date +%s) - start )) -ge 600 ]; then echo "600 s window reached"; break; fi
-            sleep 20
+          set -euo pipefail
+          bc() { docker compose exec -T --user bitcoin bitcoin bitcoin-cli -regtest -rpcport=18443 -rpcuser=bitcoin -rpcpassword=bitcoin "$@"; }
+          bc createwallet dev >/dev/null 2>&1 || bc loadwallet dev >/dev/null 2>&1 || true
+          addr=$(bc -rpcwallet=dev getnewaddress)
+          bc -rpcwallet=dev generatetoaddress 150 "$addr" > /dev/null
+          echo "blockcount after mining: $(bc getblockcount)"
+      - name: Wait for LND synced_to_chain (max 10 min)
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            s=$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 getinfo | jq -r .synced_to_chain)
+            if [ "$s" = "true" ]; then date +%s > "$RUNNER_TEMP/synced_at"; echo "LND synced_to_chain=true at $(date -u +%FT%TZ)"; exit 0; fi
+            sleep 10
           done
-          echo "== nak stderr and exit status per query (first 5 lines of stderr) =="
-          for n in unfiltered author_any k38385 k10002 d_tag_38385 control_empty; do
-            echo "-- $n: rc=$(cat "$d/$n.rc") stderr_lines=$(wc -l < "$d/$n.err")"
-            head -5 "$d/$n.err" | cut -c1-220
-          done
-          echo "== author verification =="
-          authors_all=$(jq -r '.pubkey' "$d/unfiltered.out" 2>/dev/null | sort -u | sed '/^$/d')
-          echo "distinct authors in unfiltered results: $(echo "$authors_all" | sed '/^$/d' | wc -l)"
-          echo "$authors_all" | sed '/^$/d' | sed 's/^/  author: /'
-          if echo "$authors_all" | grep -qx "$pub"; then echo "AUTHOR CHECK: computed daemon pubkey present in unfiltered results"; else echo "AUTHOR CHECK: computed daemon pubkey NOT present in unfiltered results"; fi
-          echo "authors of kind 38385 events with d=computed pubkey: $(jq -r '.pubkey' "$d/d_tag_38385.out" 2>/dev/null | sort -u | tr '\n' ' ')"
-          echo "authors of kind 38385 events filtered by computed author: $(jq -r '.pubkey' "$d/k38385.out" 2>/dev/null | sort -u | tr '\n' ' ')"
-          echo "kind 38385 tag names (first event, if any): $(head -1 "$d/k38385.out" | jq -r '[.tags[][0]] | unique | join(" ")' 2>/dev/null || true)"
-          echo "kind 10002 r-tags (first event, if any): $(head -1 "$d/k10002.out" | jq -r '[.tags[] | select(.[0]=="r") | .[1]] | join(" ")' 2>/dev/null || true)"
-          echo "== query stderr: NOTICE/CLOSED/EOSE/error lines per query =="
-          for n in unfiltered author_any k38385 k10002 d_tag_38385 control_empty; do
-            echo "-- $n:"; grep -a -i -E "notice|closed|eose|error|fail|running query|connecting" "$d/$n.err" | head -6 | cut -c1-200 | sed 's/^/   | /'
-          done
-          echo "queries that sent REQ (nak -v 'running query' line present): $(grep -l -a 'running query' "$d"/*.err 2>/dev/null | wc -l) of 6"
-      - name: Verdict - kind 38385 and 10002 retrieval, tag check, LND identity (fails if not verified)
+          echo "FAIL: LND not synced"; exit 1
+      - name: Verify maintenance OFF (wait 330 s after sync; no 'maintenance mode ON' in daemon log)
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          t0=$(cat "$RUNNER_TEMP/synced_at")
+          now=$(date +%s)
+          wait=$(( t0 + 330 - now ))
+          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+          on=$(docker logs satonero-daemon 2>&1 | grep -a -c "maintenance mode ON" || true)
+          echo "daemon 'maintenance mode ON' log lines: $on"
+          last_info=$(docker logs satonero-daemon 2>&1 | grep -a "Sending info about mostro" | tail -1 || true)
+          echo "last info-event log line: ${last_info:0:160}"
+          test "$on" = "0" || { echo "FAIL: daemon entered maintenance"; exit 1; }
+          if echo "$last_info" | grep -q "maintenance"; then echo "FAIL: last info event in maintenance"; exit 1; fi
+          echo "MAINTENANCE OFF VERIFIED"
+      - name: Generate disposable client trade key (runner temp; key never printed)
         working-directory: mostro-regtest
         run: |
           set +x
           set -euo pipefail
           umask 077
-          d="$RUNNER_TEMP/diag"
-          pub=$(cat "$RUNNER_TEMP/daemon.pub")
-          test -s "$d/k38385.out" || { echo "VERDICT FAIL: no kind 38385 retrieved by nak (rc=$(cat "$d/k38385.rc"))"; exit 1; }
-          test -s "$d/k10002.out" || { echo "VERDICT FAIL: no kind 10002 retrieved by nak (rc=$(cat "$d/k10002.rc"))"; exit 1; }
-          ev=$(head -1 "$d/k38385.out")
-          echo "$ev" | jq -e --arg p "$pub" '.pubkey == $p and .kind == 38385' >/dev/null || { echo "VERDICT FAIL: 38385 author/kind mismatch"; exit 1; }
-          for t in lnd_node_pubkey lnd_networks lnd_chains lnd_uris lnd_version fiat_currencies_accepted fee max_order_amount min_order_amount expiration_hours expiration_seconds pow hold_invoice_expiration_window hold_invoice_cltv_delta invoice_expiration_window mostro_version max_orders_per_response; do
-            echo "$ev" | jq -e --arg t "$t" 'any(.tags[]; .[0] == $t)' >/dev/null || { echo "VERDICT FAIL: missing tag $t"; exit 1; }
+          hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
+          pub=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key public "$hex")
+          printf '%s' "$hex" > "$RUNNER_TEMP/cli.hex"
+          chmod 600 "$RUNNER_TEMP/cli.hex"
+          unset hex
+          echo "client trade pubkey (public): $pub"
+          printf '%s' "$pub" > "$RUNNER_TEMP/cli.pub"
+      - name: Write client script (no secrets; key is supplied separately)
+        run: |
+          set +x
+          umask 077
+          cat > "$RUNNER_TEMP/client.sh" <<'SH'
+          #!/bin/sh
+          set -u
+          umask 077
+          DAEMON="$1"
+          TPUB="$2"
+          export NOSTR_SECRET_KEY="$(cat /tmp/cli.hex)"
+          rm -f /tmp/cli.hex
+          if [ -e /tmp/cli.hex ] || [ -z "$NOSTR_SECRET_KEY" ]; then echo "RESULT: FINAL=ERROR key load/removal failed"; exit 1; fi
+          echo "RESULT: key loaded and key file removed inside container"
+          MSG='[{"order":{"version":2,"request_id":1,"action":"new-order","payload":{"order":{"kind":"sell","fiat_code":"USD","fiat_amount":10,"amount":1000,"payment_method":"BANK_TRANSFER","premium":0}}}},null,null]'
+          CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
+          echo "RESULT: encrypt_rc=$? ciphertext_chars=${#CT}"
+          EV=$(nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null 2>/tmp/pub.err)
+          echo "RESULT: publish_rc=$? event_id=$(echo "$EV" | jq -r .id 2>/dev/null) event_pubkey=$(echo "$EV" | jq -r .pubkey 2>/dev/null)"
+          echo "RESULT: publish_stderr=$(tr '\n' ' ' < /tmp/pub.err | cut -c1-200)"
+          FINAL=INCONCLUSIVE; OID=""; GOT_ACK=0; GOT_ORDER=0
+          i=0
+          while [ $i -lt 15 ]; do
+            i=$((i+1))
+            nak req -k 14 -a "$DAEMON" -t p="$TPUB" ws://localhost:8080 < /dev/null > /tmp/ack.jsonl 2>/tmp/ack.err; ARC=$?
+            nak req -k 38383 -a "$DAEMON" ws://localhost:8080 < /dev/null > /tmp/ord.jsonl 2>/tmp/ord.err; ORC=$?
+            echo "RESULT: poll=$i ack_rc=$ARC ack_events=$(wc -l < /tmp/ack.jsonl) order38383_rc=$ORC order38383_events=$(wc -l < /tmp/ord.jsonl)"
+            if [ -s /tmp/ack.jsonl ] && [ -z "$OID" ]; then
+              while IFS= read -r line; do
+                ct=$(echo "$line" | jq -r .content)
+                pt=$(nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null 2>/tmp/dec.err)
+                echo "RESULT: ack_decrypt_rc=$? plaintext=$pt"
+                act=$(echo "$pt" | jq -r '.[0].order.action // empty' 2>/dev/null)
+                if [ "$act" = "new-order" ]; then
+                  OID=$(echo "$pt" | jq -r '.[0].order.id // empty' 2>/dev/null)
+                  GOT_ACK=1
+                  echo "RESULT: ack action=new-order order_id=$OID"
+                elif [ -n "$act" ]; then
+                  GOT_ACK=2
+                  echo "RESULT: ack action=$act (defined response, not a publication)"
+                fi
+              done < /tmp/ack.jsonl
+            fi
+            if [ -n "$OID" ] && [ -s /tmp/ord.jsonl ]; then
+              jq -c --arg id "$OID" 'select(any(.tags[]; .[0]=="d" and .[1]==$id))' /tmp/ord.jsonl > /tmp/match.jsonl
+              n=$(wc -l < /tmp/match.jsonl)
+              if [ "$n" -ge 1 ]; then
+                GOT_ORDER=1
+                echo "RESULT: 38383 with d=$OID: count=$n author=$(jq -r .pubkey /tmp/match.jsonl | head -1) kind=$(jq -r .kind /tmp/match.jsonl | head -1)"
+                echo "RESULT: 38383 tags (names): $(jq -r '[.tags[][0]] | unique | join(" ")' /tmp/match.jsonl | head -1)"
+                echo "RESULT: 38383 event_id=$(jq -r .id /tmp/match.jsonl | head -1)"
+              fi
+            fi
+            if [ "$GOT_ORDER" = "1" ] && [ "$GOT_ACK" = "1" ]; then FINAL=PASS; break; fi
+            if [ "$GOT_ACK" = "2" ]; then FINAL=CANTDO; break; fi
+            sleep 20
           done
-          lnd_id=$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 getinfo | jq -r .identity_pubkey)
-          test "$(echo "$ev" | jq -r '.tags[] | select(.[0] == "lnd_node_pubkey") | .[1]')" = "$lnd_id" || { echo "VERDICT FAIL: lnd_node_pubkey != mostro_lnd identity"; exit 1; }
-          rel=$(head -1 "$d/k10002.out")
-          echo "$rel" | jq -e --arg p "$pub" '.pubkey == $p and .kind == 10002' >/dev/null || { echo "VERDICT FAIL: 10002 author/kind mismatch"; exit 1; }
-          echo "$rel" | jq -e 'any(.tags[]; .[0] == "r" and .[1] == "ws://nostr_relay:8080")' >/dev/null || { echo "VERDICT FAIL: 10002 lacks r=ws://nostr_relay:8080"; exit 1; }
-          echo "VERDICT PASS: 38385 retrieved by nak with all required tags and lnd_node_pubkey equal to mostro_lnd; 10002 retrieved with r=ws://nostr_relay:8080"
-      - name: Relay and daemon log capture (filtered, last 200 lines each; always)
-        if: always()
+          echo "RESULT: FINAL=$FINAL order_id=$OID ack=$GOT_ACK order38383=$GOT_ORDER"
+          rm -f /tmp/cli.hex /tmp/ack.jsonl /tmp/ord.jsonl /tmp/match.jsonl /tmp/*.err
+          test ! -e /tmp/cli.hex && echo "RESULT: container key file absent"
+          SH
+          chmod 700 "$RUNNER_TEMP/client.sh"
+          test -s "$RUNNER_TEMP/client.sh"
+      - name: Run single NewOrder client (kind 14 / NIP-44) and poll for ack and kind 38383
         working-directory: mostro-regtest
         run: |
           set +x
-          echo "== nostr_relay log lines (last 200, filtered) =="
-          docker compose logs --no-color --tail 200 nostr_relay 2>&1 | grep -a -i -E "event|notice|reject|error|connect|closed|invalid|subscri|req" | tail -200 || true
-          echo "== satonero-daemon log lines (filtered) =="
-          docker logs satonero-daemon 2>&1 | grep -a -i -E "relay|send|event|error|warn|connect|sending" | tail -200 || true
-      - name: Daemon diagnostics (always; filtered log lines only)
-        if: always()
-        working-directory: mostro-regtest
-        run: |
-          set +x
-          docker inspect --format 'daemon status={{.State.Status}} exitcode={{.State.ExitCode}} restarts={{.RestartCount}}' satonero-daemon || echo "daemon container not present"
-          docker logs satonero-daemon 2>&1 | grep -a -E "ERROR|WARN|REFUSING|panic|Recorded|relay|LND|price|Sending" | tail -150 || true
-      - name: Diagnostics for nostr_relay (only when unhealthy; no healthcheck changes)
-        if: always() && steps.health.outcome == 'failure'
-        working-directory: mostro-regtest
-        run: |
+          set -uo pipefail
+          umask 077
           cid=$(docker compose ps -q nostr_relay)
-          echo "== docker inspect State.Health (nostr_relay) =="
-          docker inspect --format '{{json .State.Health}}' "$cid" || echo "inspect failed"
-          echo "== docker compose ps -a (nostr_relay) =="
-          docker compose ps -a nostr_relay || true
-          echo "== nostr_relay container logs (last 300 lines) =="
-          docker compose logs --no-color --tail 300 nostr_relay || true
-          echo "== nak relay nostr_relay:8080 =="
-          docker compose exec -T nostr_relay sh -c 'nak relay nostr_relay:8080; echo EXIT=$?' 2>&1 || true
-          echo "== nak relay http://nostr_relay:8080 =="
-          docker compose exec -T nostr_relay sh -c 'nak relay http://nostr_relay:8080; echo EXIT=$?' 2>&1 || true
-      - name: Disk and container summary
+          test -n "$cid"
+          docker cp "$RUNNER_TEMP/cli.hex" "$cid:/tmp/cli.hex"
+          rm -f "$RUNNER_TEMP/cli.hex"
+          docker cp "$RUNNER_TEMP/client.sh" "$cid:/tmp/client.sh"
+          daemon_pub=$(cat "$RUNNER_TEMP/daemon.pub")
+          cli_pub=$(cat "$RUNNER_TEMP/cli.pub")
+          timeout 420 docker compose exec -T nostr_relay sh /tmp/client.sh "$daemon_pub" "$cli_pub" > "$RUNNER_TEMP/client.out" 2> "$RUNNER_TEMP/client.err"
+          echo "client exec rc=$?"
+          cat "$RUNNER_TEMP/client.out"
+          echo "client stderr lines: $(wc -l < "$RUNNER_TEMP/client.err")"
+          docker compose exec -T nostr_relay rm -f /tmp/client.sh /tmp/cli.hex || true
+          docker compose exec -T nostr_relay sh -c 'test ! -e /tmp/cli.hex && test ! -e /tmp/client.sh && echo "container temp files absent"' || echo "CHECK FAILED"
+      - name: Verdict (PASS only if kind 38383 correlates to the ack order id)
+        run: |
+          set +x
+          f="$RUNNER_TEMP/client.out"
+          final=$(grep -a "RESULT: FINAL=" "$f" | tail -1 | sed 's/.*FINAL=//' | cut -d' ' -f1)
+          echo "VERDICT: ${final:-NONE}"
+          case "$final" in
+            PASS) echo "SUCCESS: kind 38383 published by daemon and correlated to submitted order" ;;
+            CANTDO) echo "DIAGNOSTIC ONLY: defined CantDo rejection, NOT a successful kind 38383 publication"; exit 1 ;;
+            *) echo "INCONCLUSIVE: no defined response and no kind 38383 correlation"; exit 1 ;;
+          esac
+      - name: Daemon and relay log capture (filtered; always)
         if: always()
         working-directory: mostro-regtest
         run: |
-          df -h /
-          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' || true
-          docker compose ps -a --format '{{.Service}} {{.State}} {{.Health}}' || true
+          set +x
+          docker inspect --format 'daemon status={{.State.Status}} exitcode={{.State.ExitCode}} restarts={{.RestartCount}}' satonero-daemon || true
+          docker logs satonero-daemon 2>&1 | grep -a -i -E "new order|publishing event|maintenance|reject|invalid|cant|error|warn|order id" | grep -a -v "Sending replaceable event" | tail -120 || true
+          docker compose logs --no-color --tail 300 nostr_relay 2>&1 | grep -a -i -E "persisted event|reject|invalid|NOTICE|CLOSED" | tail -60 || true
       - name: Cleanup (always) with removal verification
         if: always()
         working-directory: mostro-regtest
@@ -347,7 +382,7 @@ jobs:
           set +x
           docker rm -f satonero-daemon >/dev/null 2>&1 || true
           docker volume rm satonero-config >/dev/null 2>&1 || true
-          rm -rf "$RUNNER_TEMP/diag" || true
+          rm -rf "$RUNNER_TEMP/diag" || true; rm -f "$RUNNER_TEMP/cli.hex" "$RUNNER_TEMP/client.sh" "$RUNNER_TEMP/client.out" "$RUNNER_TEMP/client.err" "$RUNNER_TEMP/synced_at" || true
           rm -f "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/ev38385.jsonl" "$RUNNER_TEMP/ev10002.jsonl" || true
           docker compose down -v || true
           docker system prune -af --volumes || true
