@@ -190,42 +190,37 @@ jobs:
           test "$kind" = "1" && test "$tagok" = "true" && test "$content" = "$nonce" || { echo "PUBLISH FAILED: event fields differ"; exit 1; }
           printf '%s' "$id" > "$RUNNER_TEMP/ctl.id"
           echo "PUBLISH OK (event id stored in runner temp)"
-      - name: Positive control - nak -v req by id and by author (3 tries each; stderr and rc kept)
+      - name: Filter diagnostic - nak req generated filters (no relay argument, stdin from /dev/null)
         working-directory: mostro-regtest
         run: |
           set +x
           set -uo pipefail
           umask 077
-          d="$RUNNER_TEMP/pc"
+          d="$RUNNER_TEMP/pc"; mkdir -p "$d"
           id=$(cat "$RUNNER_TEMP/ctl.id")
           pub=$(cat "$RUNNER_TEMP/ctl.pub")
-          nq() {
-            local name="$1"; shift
-            timeout 40 docker compose exec -T nostr_relay nak -v req "$@" ws://localhost:8080 > "$d/$name.out" 2> "$d/$name.err"
-            echo $? > "$d/$name.rc"
-            echo "-- $name: rc=$(cat "$d/$name.rc") event_lines=$(wc -l < "$d/$name.out") stderr_lines=$(wc -l < "$d/$name.err")"
-            head -8 "$d/$name.err" | cut -c1-220 | sed 's/^/   | /'
-          }
-          for a in 1 2 3; do nq "by_id_try$a" --id "$id" --limit 5; sleep 5; done
-          for a in 1 2 3; do nq "by_author_try$a" --author "$pub" --limit 20; sleep 5; done
-          echo "nak by_id event ids (try3): $(jq -r '.id' "$d/by_id_try3.out" 2>/dev/null | tr '\n' ' ')"
-          echo "nak by_author event ids (try3): $(jq -r '.id' "$d/by_author_try3.out" 2>/dev/null | tr '\n' ' ')"
-      - name: Positive control - independent WebSocket REQ/EOSE client (python stdlib, host port 8080)
+          timeout 30 docker compose exec -T nostr_relay nak req --id "$id" --limit 5 < /dev/null > "$d/nak_id_filter.json" 2> "$d/nak_id_filter.err"; echo "nak id filter rc=$?"
+          timeout 30 docker compose exec -T nostr_relay nak req --author "$pub" --limit 20 < /dev/null > "$d/nak_author_filter.json" 2> "$d/nak_author_filter.err"; echo "nak author filter rc=$?"
+          echo "-- nak id filter stdout (raw):"; cat "$d/nak_id_filter.json"
+          echo "-- nak id filter stderr:"; head -3 "$d/nak_id_filter.err"
+          echo "-- nak author filter stdout (raw):"; cat "$d/nak_author_filter.json"
+          echo "-- nak author filter stderr:"; head -3 "$d/nak_author_filter.err"
+      - name: Filter diagnostic - compare nak filters with python filters and replay nak filters over raw WebSocket
         working-directory: mostro-regtest
         run: |
           set +x
-          set -euo pipefail
+          set -uo pipefail
           umask 077
-          cat > "$RUNNER_TEMP/wsclient.py" <<'PY'
+          cat > "$RUNNER_TEMP/rawws.py" <<'PY'
           import base64, json, os, socket, struct, sys
 
           def recv_exact(s, n):
               buf = b""
               while len(buf) < n:
-                  chunk = s.recv(n - len(buf))
-                  if not chunk:
+                  c = s.recv(n - len(buf))
+                  if not c:
                       raise ConnectionError("socket closed")
-                  buf += chunk
+                  buf += c
               return buf
 
           def ws_connect(host, port):
@@ -238,11 +233,11 @@ jobs:
               while b"\r\n\r\n" not in head:
                   c = s.recv(1)
                   if not c:
-                      raise ConnectionError("no handshake response")
+                      raise ConnectionError("no handshake")
                   head += c
               status = head.split(b"\r\n")[0].decode(errors="replace")
               if " 101 " not in status:
-                  raise ConnectionError("handshake failed: " + status)
+                  raise ConnectionError("handshake: " + status)
               return s
 
           def ws_send_text(s, text):
@@ -256,94 +251,94 @@ jobs:
                   hdr.append(0x80 | 126); hdr += struct.pack(">H", n)
               else:
                   hdr.append(0x80 | 127); hdr += struct.pack(">Q", n)
-              masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-              s.sendall(bytes(hdr) + mask + masked)
+              s.sendall(bytes(hdr) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
           def ws_recv_frame(s):
               b1, b2 = recv_exact(s, 2)
-              opcode = b1 & 0x0F
+              op = b1 & 0x0F
               n = b2 & 0x7F
               if n == 126:
                   n = struct.unpack(">H", recv_exact(s, 2))[0]
               elif n == 127:
                   n = struct.unpack(">Q", recv_exact(s, 8))[0]
-              payload = recv_exact(s, n)
-              return opcode, payload
+              return op, recv_exact(s, n)
 
-          def run_req(s, subid, flt, timeout_s=10):
+          def run(label, flt, subid):
+              s = ws_connect("127.0.0.1", 8080)
+              print("[%s] REQ %s" % (label, json.dumps(flt, sort_keys=True)))
               ws_send_text(s, json.dumps(["REQ", subid, flt]))
-              s.settimeout(timeout_s)
-              out = []
+              s.settimeout(10)
               try:
                   while True:
-                      opcode, payload = ws_recv_frame(s)
-                      if opcode == 0x9:
+                      op, payload = ws_recv_frame(s)
+                      if op == 9:
                           continue
-                      if opcode == 0x8:
-                          out.append(("CLOSE_FRAME", "", "", ""))
+                      if op == 8:
+                          print("[%s] CLOSE_FRAME from relay" % label)
                           break
-                      if opcode != 0x1:
+                      if op != 1:
+                          print("[%s] non-text opcode %d" % (label, op))
                           continue
                       text = payload.decode(errors="replace")
                       try:
                           m = json.loads(text)
                       except Exception:
-                          out.append(("NONJSON", text[:120], "", ""))
+                          print("[%s] NONJSON %s" % (label, text[:300]))
                           continue
                       kind = m[0] if isinstance(m, list) and m else "?"
-                      if kind == "EVENT" and len(m) >= 3 and isinstance(m[2], dict):
-                          ev = m[2]
-                          out.append(("EVENT", str(ev.get("id")), str(ev.get("kind")), str(ev.get("pubkey"))))
+                      if kind == "EVENT" and isinstance(m[2], dict):
+                          e = m[2]
+                          print("[%s] EVENT id=%s kind=%s pubkey=%s" % (label, e.get("id"), e.get("kind"), e.get("pubkey")))
                       else:
-                          out.append((str(kind), text[:160], "", ""))
+                          print("[%s] %s" % (label, text[:300]))
                       if kind in ("EOSE", "CLOSED"):
                           break
               except socket.timeout:
-                  out.append(("TIMEOUT", "no EOSE within %ds" % timeout_s, "", ""))
-              ws_send_text(s, json.dumps(["CLOSE", subid]))
-              return out
+                  print("[%s] TIMEOUT: no EOSE within 10 s" % label)
+              try:
+                  ws_send_text(s, json.dumps(["CLOSE", subid]))
+              except Exception:
+                  pass
+              s.close()
+
+          def load_nak(path):
+              raw = open(path, encoding="utf-8").read().strip()
+              obj = json.loads(raw)
+              if isinstance(obj, list) and len(obj) >= 3 and obj[0] == "REQ":
+                  obj = obj[2]
+              return obj
+
+          def cmp(a, b):
+              for k in sorted(set(a) | set(b)):
+                  va = a.get(k, "<absent>")
+                  vb = b.get(k, "<absent>")
+                  tag = "SAME" if va == vb else "DIFF"
+                  print("  field %-8s nak=%s  py=%s  %s  (types nak=%s py=%s)" % (k, json.dumps(va), json.dumps(vb), tag,
+                        type(va).__name__, type(vb).__name__))
 
           if __name__ == "__main__":
-              event_id, author = sys.argv[1], sys.argv[2]
-              s = ws_connect("127.0.0.1", 8080)
-              print("ws handshake: 101 OK")
-              for label, flt in (("by_id", {"ids": [event_id], "limit": 5}),
-                                 ("by_author", {"authors": [author], "limit": 20})):
-                  msgs = run_req(s, "pc-" + label, flt)
-                  for m in msgs:
-                      if m[0] == "EVENT":
-                          print("%s EVENT %s %s %s" % (label, m[1], m[2], m[3]))
-                      else:
-                          print("%s %s %s" % (label, m[0], m[1]))
-              s.close()
+              nak_id_path, nak_author_path, event_id, author = sys.argv[1:5]
+              py_id = {"ids": [event_id], "limit": 5}
+              py_author = {"authors": [author], "limit": 20}
+              for name, nak_path, py_flt in (("id", nak_id_path, py_id), ("author", nak_author_path, py_author)):
+                  try:
+                      nak_flt = load_nak(nak_path)
+                  except Exception as ex:
+                      print("[%s] nak filter not parseable as JSON: %s" % (name, ex))
+                      continue
+                  print("== %s filter comparison (nak vs python) ==" % name)
+                  cmp(nak_flt, py_flt)
+                  print("  nak filter keys: %s" % sorted(nak_flt.keys()))
+                  print("  exact-match nak==py: %s" % (nak_flt == py_flt))
+                  run("nak-%s" % name, nak_flt, "nak-" + name)
+                  run("py-%s" % name, py_flt, "py-" + name)
           PY
           id=$(cat "$RUNNER_TEMP/ctl.id")
           pub=$(cat "$RUNNER_TEMP/ctl.pub")
-          set +e
-          python3 "$RUNNER_TEMP/wsclient.py" "$id" "$pub" > "$RUNNER_TEMP/pc/ws.txt" 2> "$RUNNER_TEMP/pc/ws.err"
-          echo "ws client exit status: $?"
-          set -e
-          echo "-- ws client output:"; cat "$RUNNER_TEMP/pc/ws.txt" | cut -c1-200
-          echo "-- ws client stderr (first 5 lines):"; head -5 "$RUNNER_TEMP/pc/ws.err" || true
-      - name: Positive control - compare nak and independent client results
-        if: always()
-        working-directory: mostro-regtest
-        run: |
-          set +x
-          set -uo pipefail
-          d="$RUNNER_TEMP/pc"
-          id=$(cat "$RUNNER_TEMP/ctl.id" 2>/dev/null || echo "")
-          nak_id=$(jq -r '.id' "$d/by_id_try3.out" 2>/dev/null | sort -u | tr '\n' ' ')
-          nak_au=$(jq -r '.id' "$d/by_author_try3.out" 2>/dev/null | sort -u | tr '\n' ' ')
-          ws_id=$(awk '$1=="by_id" && $2=="EVENT"{print $3}' "$d/ws.txt" 2>/dev/null | sort -u | tr '\n' ' ')
-          ws_au=$(awk '$1=="by_author" && $2=="EVENT"{print $3}' "$d/ws.txt" 2>/dev/null | sort -u | tr '\n' ' ')
-          echo "published event id: ${id:-<none>}"
-          echo "by_id   nak=[$nak_id] ws=[$ws_id]"
-          echo "by_author nak=[$nak_au] ws=[$ws_au]"
-          [ "$nak_id" = "$ws_id" ] && echo "by_id: nak == ws" || echo "by_id: nak != ws"
-          [ "$nak_au" = "$ws_au" ] && echo "by_author: nak == ws" || echo "by_author: nak != ws"
-          echo "ws by_id EOSE/CLOSED/TIMEOUT: $(awk '$1=="by_id" && $2!="EVENT"{print $2}' "$d/ws.txt" 2>/dev/null | tr '\n' ' ')"
-          echo "ws by_author EOSE/CLOSED/TIMEOUT: $(awk '$1=="by_author" && $2!="EVENT"{print $2}' "$d/ws.txt" 2>/dev/null | tr '\n' ' ')"
+          python3 "$RUNNER_TEMP/rawws.py" "$RUNNER_TEMP/pc/nak_id_filter.json" "$RUNNER_TEMP/pc/nak_author_filter.json" "$id" "$pub" > "$RUNNER_TEMP/pc/rawws.txt" 2> "$RUNNER_TEMP/pc/rawws.err"
+          echo "rawws exit status: $?"
+          cat "$RUNNER_TEMP/pc/rawws.txt"
+          echo "-- rawws stderr (first 5 lines):"; head -5 "$RUNNER_TEMP/pc/rawws.err" || true
       - name: Positive control - relay log lines (filtered, always)
         if: always()
         working-directory: mostro-regtest
@@ -356,7 +351,7 @@ jobs:
         run: |
           set +x
           rm -rf "$RUNNER_TEMP/pc" || true
-          rm -f "$RUNNER_TEMP/ctl.hex" "$RUNNER_TEMP/ctl.pub" "$RUNNER_TEMP/ctl.nonce" "$RUNNER_TEMP/ctl.id" "$RUNNER_TEMP/wsclient.py" || true
+          rm -f "$RUNNER_TEMP/rawws.py" "$RUNNER_TEMP/pc/nak_id_filter.json" "$RUNNER_TEMP/pc/nak_author_filter.json" "$RUNNER_TEMP/ctl.hex" "$RUNNER_TEMP/ctl.pub" "$RUNNER_TEMP/ctl.nonce" "$RUNNER_TEMP/ctl.id" "$RUNNER_TEMP/wsclient.py" || true
           docker compose down -v || true
           docker system prune -af --volumes || true
           df -h /
