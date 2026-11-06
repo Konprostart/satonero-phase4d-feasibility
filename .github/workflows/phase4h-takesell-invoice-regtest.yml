@@ -204,7 +204,7 @@ jobs:
           umask 077
           req=$(docker compose exec -T --user lnd bob_lnd lncli --network=regtest --rpcserver=localhost:10001 addinvoice --amt 1000 --expiry 86400 | jq -r .payment_request)
           case "$req" in lnbcrt1*) ;; *) echo "FAIL: payout invoice is not regtest"; exit 1;; esac
-          printf '%s\n' "$req" | grep -Eq '^lnbcrt1[02-9ac-hj-np-z]{50,2000}$' || { echo "FAIL: malformed payout invoice"; exit 1; }
+          printf '%s\n' "$req" | grep -Eq '^lnbcrt([1-9][0-9]*[munp])?1[02-9ac-hj-np-z]{50,2000}$' || { echo "FAIL: malformed payout invoice"; exit 1; }
           printf '%s' "$req" > "$RUNNER_TEMP/taker_invoice.txt"
           chmod 600 "$RUNNER_TEMP/taker_invoice.txt"
           unset req
@@ -514,7 +514,7 @@ jobs:
           python3 - "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/invoice_shape.txt" <<'PY'
           import json, pathlib, re, sys
           e=pathlib.Path(sys.argv[1]); order_id=pathlib.Path(sys.argv[2]).read_text().strip(); daemon=pathlib.Path(sys.argv[3]).read_text().strip().lower(); out=pathlib.Path(sys.argv[4])
-          bolt11=re.compile(r'^lnbcrt1[02-9ac-hj-np-z]{50,2000}$')
+          bolt11=re.compile(r'^lnbcrt([1-9][0-9]*[munp])?1[02-9ac-hj-np-z]{50,2000}$')
           def load(name): return json.loads((e/name).read_text())
           req=load('taker_add_invoice_request.plain'); msg=req[0]['order']
           assert len(req)==3 and req[1] is None and req[2] is None
@@ -867,7 +867,7 @@ jobs:
                   for item in value: scan_strings(item)
               elif isinstance(value,str) and unsafe_text.search(value):
                   raise ValueError('unsafe invoice/payment/secret-like content')
-          bolt11_re=re.compile(r'^lnbcrt1[02-9ac-hj-np-z]{50,2000}$')
+          bolt11_re=re.compile(r'^lnbcrt([1-9][0-9]*[munp])?1[02-9ac-hj-np-z]{50,2000}$')
           invoice_hashes={}
           def redact(value):
               if isinstance(value,dict):
