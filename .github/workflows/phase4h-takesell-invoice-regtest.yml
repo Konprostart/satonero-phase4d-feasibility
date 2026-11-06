@@ -382,7 +382,7 @@ jobs:
           EXPR_M="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$MAKER\"]]) and .created_at>=$TSTART) | .id"
           EXPR_T="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$TAKER\"]]) and .created_at>=$TSTART) | .id"
           : > /tmp/hold.seen; : > /tmp/wait.seen
-          HOLD_ID=""; WAIT_ID=""; FINAL=WINDOW; PAYINV_NOTICES=0
+          HOLD_ID=""; WAIT_ID=""; FINAL=WINDOW; PAYINV_NOTICES=0; DECRYPT_FAILURES=0; MAKER_CANDIDATES=0; TAKER_CANDIDATES=0
           i=0
           while [ $i -lt 15 ]; do
             i=$((i+1))
@@ -394,12 +394,16 @@ jobs:
             for id in $(cat /tmp/mk.cand); do
               grep -qx "$id" /tmp/hold.seen && continue
               echo "$id" >> /tmp/hold.seen
+              MAKER_CANDIDATES=$((MAKER_CANDIDATES+1))
               timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > /tmp/mk.ev 2>/dev/null || continue
               [ -s /tmp/mk.ev ] || continue
               nak verify < /tmp/mk.ev > /dev/null 2>&1 || continue
               CT2=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
               [ -n "$CT2" ] || continue
-              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT2" < /dev/null > /tmp/mk.plain 2>/dev/null || continue
+              export NOSTR_SECRET_KEY="$(cat /tmp/maker.hex)"
+              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT2" < /dev/null > /tmp/mk.plain 2>/dev/null; DEC_RC=$?
+              unset NOSTR_SECRET_KEY
+              [ "$DEC_RC" = 0 ] || { DECRYPT_FAILURES=$((DECRYPT_FAILURES+1)); continue; }
               grep -q '"action":"pay-invoice"' /tmp/mk.plain || continue
               PAYINV_NOTICES=$((PAYINV_NOTICES+1))
               grep -q 'lnbcrt1' /tmp/mk.plain || continue
@@ -414,12 +418,16 @@ jobs:
             for id in $(cat /tmp/tk.cand); do
               grep -qx "$id" /tmp/wait.seen && continue
               echo "$id" >> /tmp/wait.seen
+              TAKER_CANDIDATES=$((TAKER_CANDIDATES+1))
               timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > /tmp/tk.ev 2>/dev/null || continue
               [ -s /tmp/tk.ev ] || continue
               nak verify < /tmp/tk.ev > /dev/null 2>&1 || continue
               CT3=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
               [ -n "$CT3" ] || continue
-              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT3" < /dev/null > /tmp/tk.plain 2>/dev/null || continue
+              export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT3" < /dev/null > /tmp/tk.plain 2>/dev/null; DEC_RC=$?
+              unset NOSTR_SECRET_KEY
+              [ "$DEC_RC" = 0 ] || { DECRYPT_FAILURES=$((DECRYPT_FAILURES+1)); continue; }
               grep -q '"action":"waiting-seller-to-pay"' /tmp/tk.plain || continue
               WAIT_ID=$id
               cp /tmp/tk.ev "$E/taker_waiting_seller_to_pay14.json"
@@ -451,7 +459,7 @@ jobs:
               FINAL=INCONCLUSIVE_FINAL_STATUS
             fi
           fi
-          echo "pay_invoice_notices=$PAYINV_NOTICES hold_invoice_selected=$HOLD_ID waiting_seller_selected=$WAIT_ID"
+          echo "pay_invoice_notices=$PAYINV_NOTICES maker_candidates=$MAKER_CANDIDATES taker_candidates=$TAKER_CANDIDATES decrypt_failures=$DECRYPT_FAILURES hold_invoice_selected=$HOLD_ID waiting_seller_selected=$WAIT_ID"
           echo "FINAL=$FINAL"
           SH
           chmod 700 "$RUNNER_TEMP/addinvoice.sh"
