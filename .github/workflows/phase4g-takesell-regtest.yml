@@ -728,7 +728,11 @@ jobs:
                   if not isinstance(tag,list) or len(tag)<2 or len(tag)>8 or any(not isinstance(x,str) or len(x)>512 or any(ord(c)<32 for c in x) for x in tag): raise ValueError('invalid tag structure: '+filename)
               receipt={'name':filename,'id':ev['id'],'pubkey':ev['pubkey'],'created_at':ev['created_at'],'kind':kind,'sig':ev['sig'],'recipient':recipient,'order_id':oid,'status':status,'order_kind':order_kind,'content_sha256':hashlib.sha256(ev['content'].encode()).hexdigest()}
               if kind==14:
-                  if tags!=[['p',recipient]]: raise ValueError('unexpected kind-14 tags: '+filename)
+                  p_tags=[tag[1:] for tag in tags if tag[0]=='p']
+                  exp_tags=[tag[1:] for tag in tags if tag[0]=='expiration']
+                  other_tags=[tag for tag in tags if tag[0] not in ('p','expiration')]
+                  if p_tags!=[[recipient]] or other_tags or len(exp_tags)>1: raise ValueError('unexpected kind-14 tags: '+filename)
+                  if exp_tags and (len(exp_tags[0])!=1 or not re.fullmatch(r'[0-9]{1,12}',exp_tags[0][0]) or int(exp_tags[0][0])<=0): raise ValueError('invalid kind-14 expiration tag: '+filename)
               else:
                   for key in ('d','s')+ (('k',) if filename.endswith('.updated.json') else ()):
                       selected=[tag for tag in tags if tag[0]==key]
