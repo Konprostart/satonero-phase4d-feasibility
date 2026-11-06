@@ -668,12 +668,14 @@ jobs:
           if-no-files-found: error
       - name: Verdict (strict; PASS only if every condition holds)
         if: always()
+        env:
+          GATE_RESULT: ${{ steps.gate.outputs.gate }}
         run: |
           set +x
           fin=$(grep -a "^FINAL=" "$RUNNER_TEMP/exec1.out" 2>/dev/null | tail -1 | cut -d= -f2)
           sh_state=$(grep -a "^shape=" "$RUNNER_TEMP/shape.txt" 2>/dev/null | tail -1 | cut -d= -f2)
           fin2=$(grep -a "^FINAL=" "$RUNNER_TEMP/exec2.out" 2>/dev/null | tail -1 | cut -d= -f2)
-          gate=$(grep -a "gate=" "$GITHUB_OUTPUT" 2>/dev/null | tail -1 | cut -d= -f2)
+          gate="${GATE_RESULT:-}"
           echo "exec1=${fin:-none} shape=${sh_state:-none} exec2=${fin2:-none} secret_gate=${gate:-none}"
           c1=$(cat "$RUNNER_TEMP/c1.txt" 2>/dev/null)
           echo "$c1" | grep -q "fail" && c1ok=no || c1ok=yes
