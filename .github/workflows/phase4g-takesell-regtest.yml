@@ -464,7 +464,8 @@ jobs:
           test "$(grep -c '^take_sell_publish_rc=' "$RUNNER_TEMP/taker.out")" = 1
           grep -q '^new_order_publish_rc=0$' "$RUNNER_TEMP/maker.out"
           grep -q '^take_sell_publish_rc=0$' "$RUNNER_TEMP/taker.out"
-          docker logs satonero-daemon 2>&1 | grep -F -q "Order Id: $order updated Nostr new Status: waiting-buyer-invoice"
+          daemon_log=$(docker logs satonero-daemon 2>&1)
+          grep -F -q "Order Id: $order updated Nostr new Status: waiting-buyer-invoice" <<<"$daemon_log"
           for f in maker_neworder14.verify.rc maker_ack14.req.rc maker_ack14.verify.rc maker.decrypt.rc order38383.initial.req.rc order38383.initial.verify.rc taker_take_sell14.verify.rc taker_add_invoice14.req.rc taker_add_invoice14.verify.rc taker.decrypt.rc maker_waiting_buyer_invoice14.req.rc maker_waiting_buyer_invoice14.verify.rc maker.decrypt.rc order38383.updated.req.rc order38383.updated.verify.rc; do
             test "$(cat "$E/$f")" = 0 || { echo "FAIL: $f"; exit 1; }
           done
