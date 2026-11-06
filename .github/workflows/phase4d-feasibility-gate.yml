@@ -337,7 +337,7 @@ jobs:
             if [ "$FETCHED_ID" != "$ACKID" ]; then FINAL=ACK_FETCH_FAIL; fi
           fi
           if [ "$FINAL" = "SELECTED" ]; then
-            nak verify "$(cat $E/ack14.json)" > $E/ack14.verify.stdout 2> $E/ack14.verify.stderr
+            nak verify < $E/ack14.json > $E/ack14.verify.stdout 2> $E/ack14.verify.stderr
             echo $? > $E/ack14.verify.rc
             if [ "$(cat $E/ack14.verify.rc)" != "0" ]; then FINAL=ACK_VERIFY_FAIL; fi
           fi
@@ -397,12 +397,12 @@ jobs:
           fi
           if [ "$FINAL" = "FOUND" ]; then
             sort -u /tmp/o38seen.txt > $E/order38383.json
-            nak verify "$(cat $E/order38383.json)" > $E/order38383.verify.stdout 2> $E/order38383.verify.stderr
+            nak verify < $E/order38383.json > $E/order38383.verify.stdout 2> $E/order38383.verify.stderr
             echo $? > $E/order38383.verify.rc
             # Negative control 1: content changed, original sig kept. Expect rc 123.
             sed 's/"content":""/"content":"x"/' $E/order38383.json > /tmp/neg1.json
             c1=$(grep -c '"content":"x"' /tmp/neg1.json || true)
-            nak verify "$(cat /tmp/neg1.json)" > $E/negative_control_content.stdout 2> $E/negative_control_content.stderr
+            nak verify < /tmp/neg1.json > $E/negative_control_content.stdout 2> $E/negative_control_content.stderr
             echo $? > $E/negative_control_content.rc
             # Negative control 2: sig first hex digit changed, id and content kept. Expect rc 123.
             sig=$(grep -o '"sig":"[0-9a-f]*"' $E/order38383.json | cut -d'"' -f4)
@@ -411,7 +411,7 @@ jobs:
             newsig="$r$(printf '%s' "$sig" | cut -c2-)"
             sed "s/\"sig\":\"$sig\"/\"sig\":\"$newsig\"/" $E/order38383.json > /tmp/neg2.json
             c2=$(grep -c "\"sig\":\"$newsig\"" /tmp/neg2.json || true)
-            nak verify "$(cat /tmp/neg2.json)" > $E/negative_control_sig.stdout 2> $E/negative_control_sig.stderr
+            nak verify < /tmp/neg2.json > $E/negative_control_sig.stdout 2> $E/negative_control_sig.stderr
             echo $? > $E/negative_control_sig.rc
             echo "neg_control_content_substitutions=$c1 neg_control_sig_substitutions=$c2"
             rm -f /tmp/neg1.json /tmp/neg2.json
