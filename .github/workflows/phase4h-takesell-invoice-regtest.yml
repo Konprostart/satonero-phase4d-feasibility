@@ -1,0 +1,1094 @@
+name: phase4h-takesell-invoice-regtest
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: phase4h-takesell-invoice-regtest
+  cancel-in-progress: false
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Pre-flight and disk gate
+        run: |
+          set -euo pipefail
+          df -h /
+          docker --version
+          docker compose version
+          jq --version
+          git --version
+      - name: Free preinstalled space
+        run: |
+          set -euo pipefail
+          for p in /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/share/swift; do
+            if [ -e "$p" ]; then sudo rm -rf "$p"; fi
+          done
+          free_kb=$(df --output=avail -k / | tail -1)
+          test "$free_kb" -ge 8388608 || { echo "INFEASIBLE-DISK: < 8 GB free"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: Konprostart/Satonero
+          ref: 2534f8b0f05ade36007445511e02747f4468109a
+          path: satonero
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: MostroP2P/mostro-regtest
+          ref: c6adbdaaaf0a2152a0728dbce6adf11945f547bd
+          path: mostro-regtest
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify pinned SHAs and clean Satonero tree
+        run: |
+          set -euo pipefail
+          test "$(git -C satonero rev-parse HEAD)" = "2534f8b0f05ade36007445511e02747f4468109a"
+          test "$(git -C mostro-regtest rev-parse HEAD)" = "c6adbdaaaf0a2152a0728dbce6adf11945f547bd"
+          test -z "$(git -C satonero status --porcelain --untracked-files=all)"
+      - name: Pin nak and apply runner-only relay healthcheck fix
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          f=docker/nostr_relay/Dockerfile
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "16c3d80abc0ec58a72b782dc78f5eab2021c3fdab386514672777d941d34f553"
+          python3 - <<'PY'
+          p = "docker/nostr_relay/Dockerfile"
+          lines = open(p, encoding="utf-8").read().split("\n")
+          i = [n for n, line in enumerate(lines) if line.startswith("RUN BIN_URL=$(curl -s https://api.github.com/repos/fiatjaf/nak/releases/latest")]
+          assert len(i) == 1, i
+          i = i[0]
+          slash = chr(92)
+          assert lines[i].endswith("grep linux-amd64) " + slash), lines[i]
+          lines[i] = "RUN BIN_URL=https://github.com/fiatjaf/nak/releases/download/v0.22.2/nak-v0.22.2-linux-amd64 " + slash
+          j = [n for n, line in enumerate(lines) if line == "  && curl -SLO $BIN_URL " + slash]
+          assert len(j) == 1, j
+          lines[j[0]:j[0] + 1] = [
+              "  && curl -fSLO $BIN_URL " + slash,
+              '  && echo "1b81a772619d913f345ecc3d663edcd37e7548ea6b4e21c582bb3826e2604556  nak-v0.22.2-linux-amd64" | sha256sum -c - ' + slash,
+          ]
+          open(p, "w", encoding="utf-8").write("\n".join(lines))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "b5b35e3d596f26552c42a63ac13134722a8924c7fca451e43ab221e3368ed00e"
+          f=docker-compose.yml
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "ac08e210765c0c95cd255be2045127f595b3da8d66a27288a4b254ff8b71ea4d"
+          python3 - <<'PY'
+          p = "docker-compose.yml"
+          text = open(p, encoding="utf-8").read()
+          old, new = "nak relay nostr_relay:8080", "nak relay http://nostr_relay:8080"
+          assert text.count(old) == 1
+          open(p, "w", encoding="utf-8").write(text.replace(old, new))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "65a3d14cc76245ec6dca5b1b939e934cbd509fe8788c1935d940def9be606b0c"
+      - name: Build Satonero daemon image
+        working-directory: satonero
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          docker compose -f docker/compose.yml build mostro
+          free_kb=$(df --output=avail -k / | tail -1)
+          test "$free_kb" -ge 3145728 || { echo "INFEASIBLE-DISK: < 3 GB free"; exit 1; }
+      - name: Start disposable regtest services and wait for health
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          docker compose up -d bitcoin mostro_lnd alice_lnd bob_lnd nostr_relay
+          for i in $(seq 1 60); do
+            out=$(docker compose ps --format '{{.Service}} {{.Health}}' bitcoin mostro_lnd alice_lnd bob_lnd nostr_relay)
+            echo "$out"
+            [ "$(printf '%s\n' "$out" | grep -c ' healthy$')" -eq 5 ] && exit 0
+            sleep 10
+          done
+          echo "FAIL: regtest healthchecks not all healthy"; exit 1
+      - name: Generate disposable daemon key and assert pre-invoice settings
+        working-directory: satonero
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
+          nsec=$(printf '%s\n' "$hex" | docker run --rm -i --entrypoint nak mostro-regtest-nostr_relay encode nsec)
+          pub=$(printf '%s\n' "$hex" | docker run --rm -i --entrypoint nak mostro-regtest-nostr_relay key public)
+          printf '%s' "$nsec" > "$RUNNER_TEMP/daemon.nsec"
+          printf '%s' "$pub" > "$RUNNER_TEMP/daemon.pub"
+          unset hex nsec
+          python3 - <<'PY'
+          import os, tomllib
+          rt = os.environ["RUNNER_TEMP"]
+          src = open("settings.tpl.toml", encoding="utf-8").read()
+          daemon_nsec = open(os.path.join(rt, "daemon.nsec"), encoding="utf-8").read().strip()
+          replacements = [
+              ("lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'", "lnd_cert_file = '/config/lnd/tls.cert'"),
+              ("lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'", "lnd_macaroon_file = '/config/lnd/admin.macaroon'"),
+              ("lnd_grpc_host = 'https://127.0.0.1:10001'", "lnd_grpc_host = 'https://mostro_lnd:10001'"),
+              ("nsec_privkey = 'nsec1...'", "nsec_privkey = '" + daemon_nsec + "'"),
+              ("relays = ['ws://localhost:7000']", "relays = ['ws://nostr_relay:8080']"),
+              ('bitcoin_price_api_url = "https://api.yadio.io"', 'bitcoin_price_api_url = "http://127.0.0.1:9"'),
+          ]
+          for old, new in replacements:
+              assert src.count(old) == 1, old
+              src = src.replace(old, new)
+          cfg = tomllib.loads(src)
+          assert cfg["mostro"]["dev_fee_enabled"] is False
+          assert cfg["mostro"]["pow"] == 0
+          assert cfg.get("anti_abuse_bond") is None or cfg["anti_abuse_bond"].get("enabled") is not True
+          assert cfg.get("cashu") is None or cfg["cashu"].get("enabled") is not True
+          assert cfg["nostr"]["relays"] == ["ws://nostr_relay:8080"]
+          open(os.path.join(rt, "settings.toml"), "w", encoding="utf-8").write(src)
+          print("settings parsed; bonds/Cashu/dev-fee payments disabled")
+          PY
+          echo "daemon pubkey: $pub"
+      - name: Install settings and start daemon
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm --entrypoint id docker-mostro -u)
+          docker volume create satonero-config >/dev/null
+          docker run --rm --user root --entrypoint sh -v satonero-config:/config -v mostro-regtest_mostro_lnd:/lnd:ro -v "$RUNNER_TEMP":/src:ro docker-mostro -c "set -e; mkdir -p /config/lnd; cp /src/settings.toml /config/settings.toml; cp /lnd/tls.cert /config/lnd/tls.cert; cp /lnd/data/chain/bitcoin/regtest/admin.macaroon /config/lnd/admin.macaroon; chmod 600 /config/settings.toml /config/lnd/admin.macaroon; chown -R $uid:$uid /config"
+          docker network inspect mostro-regtest_default >/dev/null
+          docker run -d --name satonero-daemon --network mostro-regtest_default -v satonero-config:/config docker-mostro:latest >/dev/null
+          sleep 60
+          test "$(docker inspect -f '{{.State.Running}}' satonero-daemon)" = true
+      - name: Verify LND, mine regtest blocks, sync and maintenance off
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          lnd_id=$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 getinfo | jq -r .identity_pubkey)
+          daemon_id=""
+          for i in $(seq 1 30); do
+            daemon_id=$(docker logs satonero-daemon 2>&1 | grep -a "Recorded Lightning node identity" | grep -oE '[0-9a-f]{66}' | tail -1 || true)
+            [ -n "$daemon_id" ] && break
+            sleep 10
+          done
+          test -n "$daemon_id" && test "$daemon_id" = "$lnd_id"
+          if docker logs satonero-daemon 2>&1 | grep -a -E "No connection to LND|panic|REFUSING TO START"; then echo "FAIL: daemon startup/LND error"; exit 1; fi
+          bc() { docker compose exec -T --user bitcoin bitcoin bitcoin-cli -regtest -rpcport=18443 -rpcuser=bitcoin -rpcpassword=bitcoin "$@"; }
+          bc createwallet dev >/dev/null 2>&1 || bc loadwallet dev >/dev/null 2>&1 || true
+          addr=$(bc -rpcwallet=dev getnewaddress)
+          bc -rpcwallet=dev generatetoaddress 150 "$addr" >/dev/null
+          synced=no
+          for i in $(seq 1 60); do
+            [ "$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 getinfo | jq -r .synced_to_chain)" = true ] && { synced=yes; break; }
+            sleep 10
+          done
+          test "$synced" = yes
+          channel_count=$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 listchannels | jq '.channels | length')
+          test "$channel_count" = 0 || { echo "FAIL: unexpected regtest channel count=$channel_count"; exit 1; }
+          sleep 330
+          test "$(docker logs satonero-daemon 2>&1 | grep -a -c 'maintenance mode ON' || true)" = 0
+          last_info=$(docker logs satonero-daemon 2>&1 | grep -a "Sending info about mostro" | tail -1 || true)
+          if printf '%s' "$last_info" | grep -q maintenance; then echo "FAIL: maintenance advertised"; exit 1; fi
+          echo "LND identity/sync and maintenance-off gates passed"
+      - name: Generate separate disposable maker and taker keys
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          for role in maker taker; do
+            hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
+            pub=$(printf '%s\n' "$hex" | docker run --rm -i --entrypoint nak mostro-regtest-nostr_relay key public)
+            printf '%s' "$hex" > "$RUNNER_TEMP/$role.hex"
+            printf '%s' "$pub" > "$RUNNER_TEMP/$role.pub"
+            chmod 600 "$RUNNER_TEMP/$role.hex"
+            echo "$role trade pubkey: $pub"
+            unset hex
+          done
+          test "$(cat "$RUNNER_TEMP/maker.pub")" != "$(cat "$RUNNER_TEMP/taker.pub")"
+      - name: Create one taker regtest payout invoice
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          req=$(docker compose exec -T --user lnd bob_lnd lncli --network=regtest --rpcserver=localhost:10001 addinvoice --amt 1000 --expiry 86400 | jq -r .payment_request)
+          case "$req" in lnbcrt1*) ;; *) echo "FAIL: payout invoice is not regtest"; exit 1;; esac
+          printf '%s\n' "$req" | grep -Eq '^lnbcrt1[02-9ac-hj-np-z]{50,2000}$' || { echo "FAIL: malformed payout invoice"; exit 1; }
+          printf '%s' "$req" > "$RUNNER_TEMP/taker_invoice.txt"
+          chmod 600 "$RUNNER_TEMP/taker_invoice.txt"
+          unset req
+          echo "taker payout invoice created (bolt11 withheld from logs)"
+      - name: Write Phase 4H scripts (no keys in script files)
+        run: |
+          set +x
+          umask 077
+          cat > "$RUNNER_TEMP/maker.sh" <<'SH'
+          #!/bin/sh
+          set -u
+          umask 077
+          DAEMON="$1"; MAKER="$2"; E=/tmp/evidence
+          mkdir -p "$E"; chmod 700 "$E"
+          TSEND=$(date +%s); TSTART=$((TSEND - 10))
+          MSG='[{"order":{"version":2,"request_id":101,"action":"new-order","payload":{"order":{"kind":"sell","fiat_code":"USD","fiat_amount":10,"amount":1000,"payment_method":"BANK_TRANSFER","premium":0}}}},null,null]'
+          printf '%s\n' "$MSG" > "$E/maker_neworder.plain"
+          export NOSTR_SECRET_KEY="$(cat /tmp/maker.hex)"
+          CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
+          echo "encrypt_rc=$? ciphertext_chars=${#CT}"
+          nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null > /tmp/maker.pub.out 2> /tmp/maker.pub.err
+          echo "new_order_publish_rc=$?"
+          echo "new_order_publish_stderr=$(tr '\n' ' ' < /tmp/maker.pub.err | cut -c1-200)"
+          cp /tmp/maker.pub.out "$E/maker_neworder14.json"
+          nak verify < "$E/maker_neworder14.json" > "$E/maker_neworder14.verify.stdout" 2> "$E/maker_neworder14.verify.stderr"
+          echo $? > "$E/maker_neworder14.verify.rc"
+          EXPR="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$MAKER\"]]) and .created_at>=$TSTART) | .id"
+          : > /tmp/maker.seen
+          i=0; FINAL=WINDOW
+          while [ $i -lt 15 ]; do
+            i=$((i+1))
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$MAKER" --limit 50 --jq "$EXPR" --jq-raw ws://localhost:8080 < /dev/null > /tmp/maker.cand 2> /tmp/maker.cand.err
+            rc=$?; echo "maker_ack_poll=$i rc=$rc"
+            if [ "$rc" != 0 ] || grep -Evq '^[0-9a-f]{64}$' /tmp/maker.cand; then FINAL=QUERY_FAILED; break; fi
+            cat /tmp/maker.cand >> /tmp/maker.seen
+            n=$(sort -u /tmp/maker.seen | grep -c . || true)
+            if [ "$n" -gt 1 ]; then FINAL=AMBIGUOUS_ACK; break; fi
+            sleep 20
+          done
+          n=$(sort -u /tmp/maker.seen | grep -c . || true)
+          [ "$FINAL" != WINDOW ] || { [ "$n" = 1 ] && FINAL=SELECTED || FINAL=MISSING_ACK; }
+          echo "maker_ack_candidates=$n maker_ack_final=$FINAL"
+          if [ "$FINAL" = SELECTED ]; then
+            ACKID=$(sort -u /tmp/maker.seen | grep . | head -1)
+            printf '%s\n' "$ACKID" > "$E/maker_ack14.id"
+            timeout 40 nak req --id "$ACKID" --limit 1 ws://localhost:8080 < /dev/null > "$E/maker_ack14.json" 2> "$E/maker_ack14.req.stderr"
+            echo $? > "$E/maker_ack14.req.rc"
+            nak verify < "$E/maker_ack14.json" > "$E/maker_ack14.verify.stdout" 2> "$E/maker_ack14.verify.stderr"
+            echo $? > "$E/maker_ack14.verify.rc"
+            CT2=$(timeout 40 nak req --id "$ACKID" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2> /tmp/maker.content.err)
+            nak decrypt --sender-pubkey "$DAEMON" "$CT2" < /dev/null > "$E/maker_ack.plain" 2> "$E/maker.decrypt.stderr"
+            echo $? > "$E/maker.decrypt.rc"
+            ORDER=$(grep -oE '"id":"[0-9a-f-]{36}"' "$E/maker_ack.plain" | head -1 | cut -d'"' -f4)
+            printf '%s\n' "$ORDER" > "$E/order_id.txt"
+            echo "ORDER_ID=$ORDER"
+            ORDER_EXPR="select(.kind==38383 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"d\")]==[[\"d\",\"$ORDER\"]]) and ([.tags[]|select(.[0]==\"s\")]==[[\"s\",\"pending\"]]))"
+            : > /tmp/order.initial.json
+            for j in $(seq 1 15); do
+              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 --jq "$ORDER_EXPR" ws://localhost:8080 < /dev/null > /tmp/order.initial.json 2> "$E/order38383.initial.req.stderr"
+              ORC=$?; echo "$ORC" > "$E/order38383.initial.req.rc"
+              if [ "$ORC" != 0 ]; then FINAL=QUERY_FAILED; break; fi
+              [ -s /tmp/order.initial.json ] && break
+              sleep 20
+            done
+            cp /tmp/order.initial.json "$E/order38383.initial.json"
+            if [ -s "$E/order38383.initial.json" ]; then
+              nak verify < "$E/order38383.initial.json" > "$E/order38383.initial.verify.stdout" 2> "$E/order38383.initial.verify.stderr"
+              echo $? > "$E/order38383.initial.verify.rc"
+            elif [ "$FINAL" = SELECTED ]; then
+              FINAL=INCONCLUSIVE_INITIAL_ORDER_EVENT
+            fi
+          fi
+          unset NOSTR_SECRET_KEY CT CT2 MSG
+          echo "FINAL=$FINAL"
+          SH
+          cat > "$RUNNER_TEMP/taker.sh" <<'SH'
+          #!/bin/sh
+          # Stop after the AddInvoice prompt; never submit an invoice.
+          set -u
+          umask 077
+          DAEMON="$1"; MAKER="$2"; TAKER="$3"; ORDER="$4"; E=/tmp/evidence
+          case "$ORDER" in ????????-????-????-????-????????????) ;; *) echo "FINAL=BAD_ORDER_ID"; exit 1;; esac
+          TSEND=$(date +%s); TSTART=$((TSEND - 10))
+          MSG=$(printf '[{"order":{"version":2,"request_id":202,"id":"%s","action":"take-sell","payload":null}},null,null]' "$ORDER")
+          printf '%s\n' "$MSG" > "$E/taker_take_sell.plain"
+          export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+          CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
+          nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null > /tmp/taker.pub.out 2> /tmp/taker.pub.err
+          echo "take_sell_publish_rc=$?"
+          echo "take_sell_publish_stderr=$(tr '\n' ' ' < /tmp/taker.pub.err | cut -c1-200)"
+          cp /tmp/taker.pub.out "$E/taker_take_sell14.json"
+          nak verify < "$E/taker_take_sell14.json" > "$E/taker_take_sell14.verify.stdout" 2> "$E/taker_take_sell14.verify.stderr"
+          echo $? > "$E/taker_take_sell14.verify.rc"
+          unset NOSTR_SECRET_KEY CT MSG
+          : > /tmp/taker.seen; : > /tmp/maker.seen
+          i=0; TAKER_ID=""; MAKER_ID=""; FINAL=WINDOW
+          EXPR_T="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$TAKER\"]]) and .created_at>=$TSTART) | .id"
+          EXPR_M="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$MAKER\"]]) and .created_at>=$TSTART and .id!=\"$(cat "$E/maker_ack14.id" 2>/dev/null || true)\") | .id"
+          while [ $i -lt 15 ]; do
+            i=$((i+1))
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$TAKER" --limit 50 --jq "$EXPR_T" --jq-raw ws://localhost:8080 < /dev/null > /tmp/taker.cand 2> /tmp/taker.cand.err; trc=$?
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$MAKER" --limit 50 --jq "$EXPR_M" --jq-raw ws://localhost:8080 < /dev/null > /tmp/maker.cand 2> /tmp/maker.cand.err; mrc=$?
+            echo "reply_poll=$i taker_rc=$trc maker_rc=$mrc"
+            [ "$trc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/taker.cand || { FINAL=QUERY_FAILED; break; }
+            [ "$mrc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/maker.cand || { FINAL=QUERY_FAILED; break; }
+            cat /tmp/taker.cand >> /tmp/taker.seen; cat /tmp/maker.cand >> /tmp/maker.seen
+            nt=$(sort -u /tmp/taker.seen | grep -c . || true); nm=$(sort -u /tmp/maker.seen | grep -c . || true)
+            [ "$nt" -le 1 ] && [ "$nm" -le 1 ] || { FINAL=AMBIGUOUS_REPLY; break; }
+            [ "$nt" = 1 ] && TAKER_ID=$(sort -u /tmp/taker.seen | grep . | head -1)
+            [ "$nm" = 1 ] && MAKER_ID=$(sort -u /tmp/maker.seen | grep . | head -1)
+            sleep 20
+          done
+          if [ "$FINAL" = WINDOW ]; then
+            if [ -n "$TAKER_ID" ] && [ -n "$MAKER_ID" ]; then FINAL=SELECTED; else FINAL=MISSING_REPLY; fi
+          fi
+          if [ "$FINAL" = SELECTED ]; then
+            timeout 40 nak req --id "$TAKER_ID" --limit 1 ws://localhost:8080 < /dev/null > "$E/taker_add_invoice14.json" 2> "$E/taker_add_invoice14.req.stderr"
+            echo $? > "$E/taker_add_invoice14.req.rc"
+            nak verify < "$E/taker_add_invoice14.json" > "$E/taker_add_invoice14.verify.stdout" 2> "$E/taker_add_invoice14.verify.stderr"
+            echo $? > "$E/taker_add_invoice14.verify.rc"
+            CT=$(timeout 40 nak req --id "$TAKER_ID" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2> /tmp/taker.content.err)
+            export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+            nak decrypt --sender-pubkey "$DAEMON" "$CT" < /dev/null > "$E/taker_add_invoice14.plain" 2> "$E/taker.decrypt.stderr"
+            echo $? > "$E/taker.decrypt.rc"
+            unset NOSTR_SECRET_KEY
+            timeout 40 nak req --id "$MAKER_ID" --limit 1 ws://localhost:8080 < /dev/null > "$E/maker_waiting_buyer_invoice14.json" 2> "$E/maker_waiting_buyer_invoice14.req.stderr"
+            echo $? > "$E/maker_waiting_buyer_invoice14.req.rc"
+            nak verify < "$E/maker_waiting_buyer_invoice14.json" > "$E/maker_waiting_buyer_invoice14.verify.stdout" 2> "$E/maker_waiting_buyer_invoice14.verify.stderr"
+            echo $? > "$E/maker_waiting_buyer_invoice14.verify.rc"
+            CT=$(timeout 40 nak req --id "$MAKER_ID" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2> /tmp/maker.content.err)
+            export NOSTR_SECRET_KEY="$(cat /tmp/maker.hex)"
+            nak decrypt --sender-pubkey "$DAEMON" "$CT" < /dev/null > "$E/maker_waiting_buyer_invoice14.plain" 2> "$E/maker.decrypt.stderr"
+            echo $? > "$E/maker.decrypt.rc"
+            unset NOSTR_SECRET_KEY
+            event_found=no
+            for p in $(seq 1 15); do
+              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 --jq 'select(any(.tags[]; .[0]=="s" and .[1]=="in-progress"))' ws://localhost:8080 < /dev/null > "$E/order38383.updated.json" 2> "$E/order38383.updated.req.stderr"
+              orc=$?; echo "$orc" > "$E/order38383.updated.req.rc"
+              if [ "$orc" = 0 ] && grep -q '"kind":38383' "$E/order38383.updated.json"; then event_found=yes; break; fi
+              sleep 20
+            done
+            if [ "$event_found" = yes ]; then
+              nak verify < "$E/order38383.updated.json" > "$E/order38383.updated.verify.stdout" 2> "$E/order38383.updated.verify.stderr"
+              echo $? > "$E/order38383.updated.verify.rc"
+            else
+              FINAL=INCONCLUSIVE_ORDER_EVENT
+            fi
+          fi
+          echo "maker_reply_id=$MAKER_ID taker_reply_id=$TAKER_ID final=$FINAL"
+          echo "FINAL=$FINAL"
+          SH
+          chmod 700 "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/taker.sh"
+          cat > "$RUNNER_TEMP/addinvoice.sh" <<'SH'
+          #!/bin/sh
+          # Submit exactly one AddInvoice for the taker and capture the daemon replies.
+          set -u
+          umask 077
+          DAEMON="$1"; MAKER="$2"; TAKER="$3"; ORDER="$4"; E=/tmp/evidence
+          INVOICE=$(cat /tmp/taker_invoice.txt 2>/dev/null || true)
+          case "$ORDER" in ????????-????-????-????-????????????) ;; *) echo "FINAL=BAD_ORDER_ID"; exit 1;; esac
+          case "$INVOICE" in lnbcrt1*) ;; *) echo "FINAL=BAD_INVOICE"; exit 1;; esac
+          TSEND=$(date +%s); TSTART=$((TSEND - 10))
+          MSG=$(printf '[{"order":{"version":2,"request_id":203,"id":"%s","action":"add-invoice","payload":{"payment_request":[null,"%s",null]}}},null,null]' "$ORDER" "$INVOICE")
+          printf '%s\n' "$MSG" > "$E/taker_add_invoice_request.plain"
+          chmod 600 "$E/taker_add_invoice_request.plain"
+          export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+          CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
+          nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null > /tmp/addinv.pub.out 2> /tmp/addinv.pub.err
+          echo "add_invoice_publish_rc=$?"
+          echo "add_invoice_publish_stderr=$(tr '\n' ' ' < /tmp/addinv.pub.err | cut -c1-200)"
+          cp /tmp/addinv.pub.out "$E/taker_add_invoice_request14.json"
+          nak verify < "$E/taker_add_invoice_request14.json" > "$E/taker_add_invoice_request14.verify.stdout" 2> "$E/taker_add_invoice_request14.verify.stderr"
+          echo $? > "$E/taker_add_invoice_request14.verify.rc"
+          unset NOSTR_SECRET_KEY CT MSG
+          EXPR_M="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$MAKER\"]]) and .created_at>=$TSTART) | .id"
+          EXPR_T="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$TAKER\"]]) and .created_at>=$TSTART) | .id"
+          : > /tmp/hold.seen; : > /tmp/wait.seen
+          HOLD_ID=""; WAIT_ID=""; FINAL=WINDOW; PAYINV_NOTICES=0
+          i=0
+          while [ $i -lt 15 ]; do
+            i=$((i+1))
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$MAKER" --limit 50 --jq "$EXPR_M" --jq-raw ws://localhost:8080 < /dev/null > /tmp/mk.cand 2> /tmp/mk.cand.err; mrc=$?
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$TAKER" --limit 50 --jq "$EXPR_T" --jq-raw ws://localhost:8080 < /dev/null > /tmp/tk.cand 2> /tmp/tk.cand.err; trc=$?
+            echo "invoice_poll=$i maker_rc=$mrc taker_rc=$trc"
+            [ "$mrc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/mk.cand || { FINAL=QUERY_FAILED; break; }
+            [ "$trc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/tk.cand || { FINAL=QUERY_FAILED; break; }
+            for id in $(cat /tmp/mk.cand); do
+              grep -qx "$id" /tmp/hold.seen && continue
+              echo "$id" >> /tmp/hold.seen
+              timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > /tmp/mk.ev 2>/dev/null || continue
+              [ -s /tmp/mk.ev ] || continue
+              nak verify < /tmp/mk.ev > /dev/null 2>&1 || continue
+              CT2=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
+              [ -n "$CT2" ] || continue
+              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT2" < /dev/null > /tmp/mk.plain 2>/dev/null || continue
+              grep -q '"action":"pay-invoice"' /tmp/mk.plain || continue
+              PAYINV_NOTICES=$((PAYINV_NOTICES+1))
+              grep -q 'lnbcrt1' /tmp/mk.plain || continue
+              HOLD_ID=$id
+              cp /tmp/mk.ev "$E/maker_pay_invoice14.json"
+              cp /tmp/mk.plain "$E/maker_pay_invoice14.plain"
+              printf '%s\n' "$id" > "$E/maker_pay_invoice14.id"
+              nak verify < "$E/maker_pay_invoice14.json" > "$E/maker_pay_invoice14.verify.stdout" 2> "$E/maker_pay_invoice14.verify.stderr"
+              echo $? > "$E/maker_pay_invoice14.verify.rc"
+              break
+            done
+            for id in $(cat /tmp/tk.cand); do
+              grep -qx "$id" /tmp/wait.seen && continue
+              echo "$id" >> /tmp/wait.seen
+              timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > /tmp/tk.ev 2>/dev/null || continue
+              [ -s /tmp/tk.ev ] || continue
+              nak verify < /tmp/tk.ev > /dev/null 2>&1 || continue
+              CT3=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
+              [ -n "$CT3" ] || continue
+              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT3" < /dev/null > /tmp/tk.plain 2>/dev/null || continue
+              grep -q '"action":"waiting-seller-to-pay"' /tmp/tk.plain || continue
+              WAIT_ID=$id
+              cp /tmp/tk.ev "$E/taker_waiting_seller_to_pay14.json"
+              cp /tmp/tk.plain "$E/taker_waiting_seller_to_pay14.plain"
+              printf '%s\n' "$id" > "$E/taker_waiting_seller_to_pay14.id"
+              nak verify < "$E/taker_waiting_seller_to_pay14.json" > "$E/taker_waiting_seller_to_pay14.verify.stdout" 2> "$E/taker_waiting_seller_to_pay14.verify.stderr"
+              echo $? > "$E/taker_waiting_seller_to_pay14.verify.rc"
+              break
+            done
+            [ -n "$HOLD_ID" ] && [ -n "$WAIT_ID" ] && break
+            sleep 20
+          done
+          if [ -n "$HOLD_ID" ] && [ -n "$WAIT_ID" ]; then FINAL=SELECTED
+          elif [ -z "$HOLD_ID" ]; then FINAL=MISSING_HOLD_INVOICE
+          else FINAL=MISSING_WAITING_SELLER
+          fi
+          if [ "$FINAL" = SELECTED ]; then
+            event_found=no
+            for p in $(seq 1 15); do
+              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 --jq 'select(any(.tags[]; .[0]=="s" and .[1]=="waiting-payment"))' ws://localhost:8080 < /dev/null > "$E/order38383.waitingpayment.json" 2> "$E/order38383.waitingpayment.req.stderr"
+              orc=$?; echo "$orc" > "$E/order38383.waitingpayment.req.rc"
+              if [ "$orc" = 0 ] && grep -q '"kind":38383' "$E/order38383.waitingpayment.json"; then event_found=yes; break; fi
+              sleep 20
+            done
+            if [ "$event_found" = yes ]; then
+              nak verify < "$E/order38383.waitingpayment.json" > "$E/order38383.waitingpayment.verify.stdout" 2> "$E/order38383.waitingpayment.verify.stderr"
+              echo $? > "$E/order38383.waitingpayment.verify.rc"
+            else
+              FINAL=INCONCLUSIVE_FINAL_STATUS
+            fi
+          fi
+          echo "pay_invoice_notices=$PAYINV_NOTICES hold_invoice_selected=$HOLD_ID waiting_seller_selected=$WAIT_ID"
+          echo "FINAL=$FINAL"
+          SH
+          chmod 700 "$RUNNER_TEMP/addinvoice.sh"
+      - name: Run single maker NewOrder and capture ACK
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
+          docker cp "$RUNNER_TEMP/maker.hex" "$cid:/tmp/maker.hex"
+          docker cp "$RUNNER_TEMP/taker.hex" "$cid:/tmp/taker.hex"
+          docker cp "$RUNNER_TEMP/maker.sh" "$cid:/tmp/maker.sh"
+          docker cp "$RUNNER_TEMP/taker.sh" "$cid:/tmp/taker.sh"
+          daemon=$(cat "$RUNNER_TEMP/daemon.pub"); maker=$(cat "$RUNNER_TEMP/maker.pub"); taker=$(cat "$RUNNER_TEMP/taker.pub")
+          timeout 900 docker compose exec -T nostr_relay sh /tmp/maker.sh "$daemon" "$maker" > "$RUNNER_TEMP/maker.out" 2> "$RUNNER_TEMP/maker.err"
+          echo "maker script rc=$?"
+          cat "$RUNNER_TEMP/maker.out"
+          rm -rf "$RUNNER_TEMP/evidence"
+          docker cp "$cid:/tmp/evidence" "$RUNNER_TEMP/"
+          order=$(cat "$RUNNER_TEMP/evidence/order_id.txt" 2>/dev/null || true)
+          echo "order id present=$([ -n "$order" ] && echo yes || echo no)"
+          printf '%s' "$order" > "$RUNNER_TEMP/order_id.txt"
+      - name: Run exactly one taker TakeSell and capture both responses
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          order=$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || true)
+          if [ -z "$order" ]; then echo "FINAL=INCONCLUSIVE_NO_ORDER_ID"; exit 0; fi
+          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
+          daemon=$(cat "$RUNNER_TEMP/daemon.pub"); maker=$(cat "$RUNNER_TEMP/maker.pub"); taker=$(cat "$RUNNER_TEMP/taker.pub")
+          timeout 900 docker compose exec -T nostr_relay sh /tmp/taker.sh "$daemon" "$maker" "$taker" "$order" > "$RUNNER_TEMP/taker.out" 2> "$RUNNER_TEMP/taker.err"
+          echo "taker script rc=$?"
+          cat "$RUNNER_TEMP/taker.out"
+          docker cp "$cid:/tmp/evidence/." "$RUNNER_TEMP/evidence/"
+      - name: Run exactly one taker AddInvoice and capture seller hold invoice
+        if: always()
+        continue-on-error: true
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          order=$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || true)
+          if [ -z "$order" ] || [ ! -s "$RUNNER_TEMP/taker_invoice.txt" ]; then echo "FINAL=INCONCLUSIVE_NO_ORDER_ID"; exit 0; fi
+          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
+          docker cp "$RUNNER_TEMP/addinvoice.sh" "$cid:/tmp/addinvoice.sh"
+          docker cp "$RUNNER_TEMP/taker_invoice.txt" "$cid:/tmp/taker_invoice.txt"
+          daemon=$(cat "$RUNNER_TEMP/daemon.pub"); maker=$(cat "$RUNNER_TEMP/maker.pub"); taker=$(cat "$RUNNER_TEMP/taker.pub")
+          timeout 900 docker compose exec -T nostr_relay sh /tmp/addinvoice.sh "$daemon" "$maker" "$taker" "$order" > "$RUNNER_TEMP/addinvoice.out" 2> "$RUNNER_TEMP/addinvoice.err"
+          echo "addinvoice script rc=$?"
+          cat "$RUNNER_TEMP/addinvoice.out"
+          docker cp "$cid:/tmp/evidence/." "$RUNNER_TEMP/evidence/"
+      - name: Validate invoice handshake shapes
+        id: invoice_validation
+        if: always()
+        continue-on-error: true
+        run: |
+          set +x
+          set -uo pipefail
+          python3 - "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/invoice_shape.txt" <<'PY'
+          import json, pathlib, re, sys
+          e=pathlib.Path(sys.argv[1]); order_id=pathlib.Path(sys.argv[2]).read_text().strip(); daemon=pathlib.Path(sys.argv[3]).read_text().strip().lower(); out=pathlib.Path(sys.argv[4])
+          bolt11=re.compile(r'^lnbcrt1[02-9ac-hj-np-z]{50,2000}$')
+          def load(name): return json.loads((e/name).read_text())
+          req=load('taker_add_invoice_request.plain'); msg=req[0]['order']
+          assert len(req)==3 and req[1] is None and req[2] is None
+          assert msg['action']=='add-invoice' and msg['request_id']==203 and msg['id']==order_id
+          pr=msg['payload']['payment_request']
+          assert isinstance(pr,list) and len(pr)==3 and pr[0] is None and pr[2] is None and bolt11.fullmatch(pr[1])
+          payout=pr[1]
+          pay=load('maker_pay_invoice14.plain')[0]['order']
+          assert pay['action']=='pay-invoice' and pay['request_id']==203 and pay['id']==order_id
+          hp=pay['payload']['payment_request']
+          assert isinstance(hp,list) and len(hp)==3 and hp[2] is None and bolt11.fullmatch(hp[1])
+          hold=hp[1]
+          assert hold!=payout
+          ho=hp[0]
+          assert ho['id']==order_id and ho['kind']=='sell' and ho['status']=='waiting-payment' and ho['amount']==1000
+          assert ho.get('buyer_invoice') is None
+          wait=load('taker_waiting_seller_to_pay14.plain')[0]['order']
+          assert wait['action']=='waiting-seller-to-pay' and wait['id']==order_id and wait['payload'] is None
+          ev=load('order38383.waitingpayment.json')
+          assert ev['kind']==38383 and ev['pubkey']==daemon
+          assert [t for t in ev['tags'] if t[0]=='d']==[['d',order_id]]
+          assert any(t==['s','waiting-payment'] for t in ev['tags'])
+          assert any(t==['k','sell'] for t in ev['tags'])
+          assert ev['content']==''
+          out.write_text('shape=invoice_handshake_ok\n')
+          print('invoice handshake ok; payout and hold invoices withheld')
+          PY
+      - name: Assert no payment, channel, bond or settlement activity
+        id: no_payment_gate
+        if: always()
+        continue-on-error: true
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          check_node() {
+            svc=$1
+            ln() { docker compose exec -T --user lnd "$svc" lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+            # Any lncli or jq failure aborts the gate; malformed shapes are rejected
+            # explicitly so a missing or mistyped field can never read as zero.
+            inv=$(ln listinvoices)
+            printf '%s' "$inv" | jq -e 'type=="object" and (.invoices|type=="array") and all(.invoices[]; (.state|type)=="string")' > /dev/null
+            settled=$(printf '%s' "$inv" | jq '[.invoices[] | select(.state=="SETTLED")] | length')
+            accepted=$(printf '%s' "$inv" | jq '[.invoices[] | select(.state=="ACCEPTED")] | length')
+            pay=$(ln listpayments --include_incomplete)
+            printf '%s' "$pay" | jq -e 'type=="object" and (.payments|type=="array") and all(.payments[]; type=="object")' > /dev/null
+            payments=$(printf '%s' "$pay" | jq '.payments | length')
+            chans=$(ln listchannels)
+            printf '%s' "$chans" | jq -e 'type=="object" and (.channels|type=="array")' > /dev/null
+            channels=$(printf '%s' "$chans" | jq '.channels | length')
+            pend=$(ln pendingchannels)
+            printf '%s' "$pend" | jq -e 'type=="object" and (.pending_open_channels|type=="array") and (.pending_closing_channels|type=="array") and (.pending_force_closing_channels|type=="array") and (.waiting_close_channels|type=="array")' > /dev/null
+            pending=$(printf '%s' "$pend" | jq '((.pending_open_channels|length) + (.pending_closing_channels|length) + (.pending_force_closing_channels|length) + (.waiting_close_channels|length))')
+            test "$settled" = 0
+            test "$accepted" = 0
+            test "$payments" = 0
+            test "$channels" = 0
+            test "$pending" = 0
+            echo "no-payment gate $svc: settled=$settled accepted=$accepted payments=$payments channels=$channels pending=$pending"
+          }
+          check_node mostro_lnd
+          check_node bob_lnd
+      - name: Validate public handshake shapes and order correlation
+        id: handshake_validation
+        if: always()
+        continue-on-error: true
+        run: |
+          set +x
+          set -uo pipefail
+          python3 - "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/taker.pub" "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/shape.txt" <<'PY'
+          # AddInvoice is direction-overloaded in the pinned daemon/client contract:
+          # the daemon prompt carries an Order; the client sends PaymentRequest only
+          # after a user submits an invoice. This harness stops at the prompt.
+          import json, pathlib, sys
+          e=pathlib.Path(sys.argv[1]); daemon,maker,taker=[pathlib.Path(p).read_text().strip().lower() for p in sys.argv[2:5]]
+          order_id=pathlib.Path(sys.argv[5]).read_text().strip(); out=pathlib.Path(sys.argv[6])
+          results=[]
+          def load(name): return json.loads((e/name).read_text())
+          def order_msg(name):
+              x=load(name); return x[0].get('order'),x
+          assert maker != taker
+          maker_req_tuple=load('maker_neworder.plain'); maker_req=maker_req_tuple[0]['order']
+          assert len(maker_req_tuple)==3 and maker_req_tuple[1] is None and maker_req_tuple[2] is None
+          assert maker_req['action']=='new-order' and maker_req['request_id']==101 and maker_req.get('id') is None
+          assert maker_req['payload']['order']['kind']=='sell' and not maker_req['payload']['order'].get('buyer_invoice')
+          assert not maker_req['payload']['order'].get('cashu_mint_url')
+          assert 'payment_request' not in maker_req['payload']
+          maker_event=load('maker_neworder14.json')
+          assert maker_event['kind']==14 and maker_event['pubkey'].lower()==maker
+          assert [t for t in maker_event['tags'] if t[0]=='p']==[['p',daemon]]
+          results.append('maker_request_and_outer_event_ok')
+          ack_tuple=load('maker_ack.plain'); ack=ack_tuple[0]['order']
+          assert len(ack_tuple)==3 and ack_tuple[1] is None and ack_tuple[2] is None
+          assert ack['action']=='new-order' and ack['request_id']==101 and ack['id']==order_id and ack['payload']['order']['id']==order_id
+          assert ack['payload']['order']['kind']=='sell' and not ack['payload']['order'].get('buyer_invoice')
+          ack_ev=load('maker_ack14.json')
+          assert ack_ev['kind']==14 and ack_ev['pubkey'].lower()==daemon
+          assert [t for t in ack_ev['tags'] if t[0]=='p']==[['p',maker]]
+          results.append('maker_new_order_ack_ok')
+          take_tuple=load('taker_take_sell.plain'); take=take_tuple[0]['order']
+          assert len(take_tuple)==3 and take_tuple[1] is None and take_tuple[2] is None
+          assert take['action']=='take-sell' and take['id']==order_id and take['request_id']==202
+          assert take.get('payload') is None and take.get('trade_index') is None
+          take_event=load('taker_take_sell14.json')
+          assert take_event['kind']==14 and take_event['pubkey'].lower()==taker
+          assert [t for t in take_event['tags'] if t[0]=='p']==[['p',daemon]]
+          results.append('one_taker_take_sell_request_ok')
+          add_tuple=load('taker_add_invoice14.plain'); add=add_tuple[0]['order']
+          assert len(add_tuple)==3 and add_tuple[1] is None and add_tuple[2] is None
+          assert add['action']=='add-invoice' and add['id']==order_id and add['request_id']==202
+          assert add['payload']['order']['id']==order_id and add['payload']['order']['status']=='waiting-buyer-invoice'
+          assert not add['payload']['order'].get('buyer_invoice') and not add['payload']['order'].get('cashu_mint_url')
+          assert 'payment_request' not in add['payload']
+          assert 'lnbc' not in json.dumps(add).lower() and 'lnurl' not in json.dumps(add).lower()
+          add_ev=load('taker_add_invoice14.json')
+          assert add_ev['kind']==14 and add_ev['pubkey'].lower()==daemon
+          assert [t for t in add_ev['tags'] if t[0]=='p']==[['p',taker]]
+          results.append('taker_add_invoice_prompt_ok')
+          wait_tuple=load('maker_waiting_buyer_invoice14.plain'); wait=wait_tuple[0]['order']
+          assert len(wait_tuple)==3 and wait_tuple[1] is None and wait_tuple[2] is None
+          assert wait['action']=='waiting-buyer-invoice' and wait['id']==order_id and wait['request_id']==202
+          assert wait.get('payload') is None
+          wait_ev=load('maker_waiting_buyer_invoice14.json')
+          assert wait_ev['kind']==14 and wait_ev['pubkey'].lower()==daemon
+          assert [t for t in wait_ev['tags'] if t[0]=='p']==[['p',maker]]
+          results.append('maker_waiting_buyer_invoice_ok')
+          for name in ('order38383.initial.json','order38383.updated.json'):
+              ev=load(name); assert ev['kind']==38383 and ev['pubkey'].lower()==daemon
+              assert [t for t in ev['tags'] if t[0]=='d']==[['d',order_id]]
+          initial=load('order38383.initial.json'); updated=load('order38383.updated.json')
+          assert any(t==['s','pending'] for t in initial['tags'])
+          assert any(t==['s','in-progress'] for t in updated['tags'])
+          assert any(t==['k','sell'] for t in updated['tags'])
+          results.append('order38383_transition_ok')
+          out.write_text('shape=preinvoice_handshake_ok\n'+'\n'.join(results)+'\n')
+          print('\n'.join(results))
+          PY
+      - name: C1 checks and sanitized manifest
+        id: c1_checks
+        if: always()
+        continue-on-error: true
+        run: |
+          set +x
+          set -euo pipefail
+          E="$RUNNER_TEMP/evidence"
+          order=$(cat "$RUNNER_TEMP/order_id.txt")
+          test "$(grep -c '^new_order_publish_rc=' "$RUNNER_TEMP/maker.out")" = 1
+          test "$(grep -c '^take_sell_publish_rc=' "$RUNNER_TEMP/taker.out")" = 1
+          grep -q '^new_order_publish_rc=0$' "$RUNNER_TEMP/maker.out"
+          grep -q '^take_sell_publish_rc=0$' "$RUNNER_TEMP/taker.out"
+          test "$(grep -c '^add_invoice_publish_rc=' "$RUNNER_TEMP/addinvoice.out")" = 1
+          grep -q '^add_invoice_publish_rc=0$' "$RUNNER_TEMP/addinvoice.out"
+          daemon_log=$(docker logs satonero-daemon 2>&1)
+          grep -F -q "Order Id: $order updated Nostr new Status: waiting-payment" <<<"$daemon_log"
+          for f in maker_neworder14.verify.rc maker_ack14.req.rc maker_ack14.verify.rc maker.decrypt.rc order38383.initial.req.rc order38383.initial.verify.rc taker_take_sell14.verify.rc taker_add_invoice14.req.rc taker_add_invoice14.verify.rc taker.decrypt.rc maker_waiting_buyer_invoice14.req.rc maker_waiting_buyer_invoice14.verify.rc maker.decrypt.rc order38383.updated.req.rc order38383.updated.verify.rc taker_add_invoice_request14.verify.rc maker_pay_invoice14.verify.rc taker_waiting_seller_to_pay14.verify.rc order38383.waitingpayment.req.rc order38383.waitingpayment.verify.rc; do
+            test "$(cat "$E/$f")" = 0 || { echo "FAIL: $f"; exit 1; }
+          done
+          cat > "$E/manifest.txt" <<EOF
+          run_id=${GITHUB_RUN_ID}
+          source=satonero:2534f8b0f05ade36007445511e02747f4468109a regtest:c6adbdaaaf0a2152a0728dbce6adf11945f547bd nak:v0.22.2
+          maker_pubkey=$(cat "$RUNNER_TEMP/maker.pub")
+          taker_pubkey=$(cat "$RUNNER_TEMP/taker.pub")
+          order_id=$(cat "$RUNNER_TEMP/order_id.txt")
+          actions_sent=new-order,take-sell,add-invoice order_limit=1 take_count=1 add_invoice_count=1 retries=0 payments=0 channels=0 invoices=1
+          EOF
+          cat "$E/manifest.txt"
+      - name: Classify handshake outcome separately from secret gate
+        id: handshake_result
+        if: always()
+        env:
+          VALIDATION_OUTCOME: ${{ steps.handshake_validation.outcome }}
+          C1_OUTCOME: ${{ steps.c1_checks.outcome }}
+          INVOICE_OUTCOME: ${{ steps.invoice_validation.outcome }}
+        run: |
+          set +x
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP" "${VALIDATION_OUTCOME:-}" "${C1_OUTCOME:-}" "${INVOICE_OUTCOME:-}" <<'PY'
+          import os, pathlib, re, sys
+          rt=pathlib.Path(sys.argv[1]); validation,c1,invoice=sys.argv[2:]
+          def terminal(name):
+              path=rt/name
+              if not path.is_file(): return None
+              values=[line[6:].strip() for line in path.read_text(errors='replace').splitlines() if line.startswith('FINAL=')]
+              return values[0] if len(values)==1 else None
+          maker=terminal('maker.out'); taker=terminal('taker.out'); addinv=terminal('addinvoice.out')
+          event_names=('maker_neworder14.json','maker_ack14.json','taker_take_sell14.json','taker_add_invoice14.json','maker_waiting_buyer_invoice14.json','order38383.initial.json','order38383.updated.json','taker_add_invoice_request14.json','maker_pay_invoice14.json','taker_waiting_seller_to_pay14.json','order38383.waitingpayment.json')
+          plain_names=('maker_neworder.plain','maker_ack.plain','taker_take_sell.plain','taker_add_invoice14.plain','maker_waiting_buyer_invoice14.plain','taker_add_invoice_request.plain','maker_pay_invoice14.plain','taker_waiting_seller_to_pay14.plain')
+          evidence=rt/'evidence'
+          required=[rt/name for name in ('daemon.pub','maker.pub','taker.pub','order_id.txt')]
+          required += [evidence/name for name in event_names+plain_names]
+          verify_paths=[evidence/name.replace('.json','.verify.rc') for name in event_names]
+          try:
+              complete=all(p.is_file() and p.stat().st_size>0 for p in required+verify_paths)
+              verify_values=[p.read_text(encoding='ascii').strip() for p in verify_paths] if complete else []
+          except OSError:
+              complete=False; verify_values=[]
+          verify_failure=complete and any(re.fullmatch(r'[1-9][0-9]*',value) for value in verify_values)
+          verify_success=complete and len(verify_values)==len(verify_paths) and all(value=='0' for value in verify_values)
+          if 'BAD_ORDER_ID' in (maker,taker,addinv) or 'BAD_INVOICE' in (maker,taker,addinv):
+              result='FAIL'
+          elif any(v in ('AMBIGUOUS_ACK','AMBIGUOUS_REPLY') for v in (maker,taker,addinv)):
+              result='INCONCLUSIVE'
+          elif maker=='SELECTED' and taker=='SELECTED' and addinv=='SELECTED':
+              if not complete: result='INCONCLUSIVE'
+              elif verify_failure: result='FAIL'
+              elif validation=='success' and c1=='success' and invoice=='success' and verify_success: result='PASS'
+              elif c1=='success' and (validation=='failure' or invoice=='failure'): result='FAIL'
+              else: result='INCONCLUSIVE'
+          else:
+              result='INCONCLUSIVE'
+          (rt/'handshake_result.txt').write_text(result+'\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as f: f.write(f'result={result}\n')
+          print(f'HANDSHAKE_RESULT={result} MAKER_FINAL={maker or "missing/ambiguous"} TAKER_FINAL={taker or "missing/ambiguous"} INVOICE_FINAL={addinv or "missing/ambiguous"}')
+          PY
+          result=$(cat "$RUNNER_TEMP/handshake_result.txt")
+          E="$RUNNER_TEMP/evidence"
+          mkdir -p "$E"
+          if [ ! -e "$RUNNER_TEMP/shape.txt" ]; then
+            python3 - "$E" "$RUNNER_TEMP/shape.txt" <<'PY'
+          import json, pathlib, sys
+          e=pathlib.Path(sys.argv[1]); out=pathlib.Path(sys.argv[2])
+          names=('maker_neworder.plain','maker_ack.plain','taker_take_sell.plain','taker_add_invoice14.plain','maker_waiting_buyer_invoice14.plain')
+          present=[]; invalid=False
+          for name in names:
+              p=e/name
+              if not p.exists() or not p.stat().st_size: continue
+              present.append(name)
+              try:
+                  value=json.loads(p.read_text())
+                  valid=isinstance(value,list) and len(value)==3 and value[1] is None and value[2] is None and isinstance(value[0],dict) and ('order' in value[0] or 'cant-do' in value[0])
+                  text=json.dumps(value).lower()
+                  valid=valid and 'lnbc' not in text and 'lnurl' not in text and 'payment_request' not in text
+                  if not valid: invalid=True
+              except Exception:
+                  invalid=True
+          shape='unexpected_shape' if invalid else ('partial_expected' if present else 'not_applicable')
+          out.write_text('shape='+shape+'\n')
+          PY
+          fi
+          if [ ! -s "$E/manifest.txt" ]; then
+            { echo "run_id=${GITHUB_RUN_ID}"; echo "source=satonero:2534f8b0f05ade36007445511e02747f4468109a regtest:c6adbdaaaf0a2152a0728dbce6adf11945f547bd nak:v0.22.2"; echo "order_id=$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || echo none)"; echo "handshake=$result"; echo 'actions_sent=new-order,take-sell order_limit=1 take_count=1 retries=0 payments=0 channels=0 invoices=0'; } > "$E/manifest.txt"
+          fi
+          if ! grep -q '^handshake=' "$E/manifest.txt"; then printf 'handshake=%s\n' "$result" >> "$E/manifest.txt"; fi
+          echo "C1_OUTCOME=${C1_OUTCOME:-missing} VALIDATION_OUTCOME=${VALIDATION_OUTCOME:-missing}"
+      - name: Secret gate (six mandatory checks)
+        id: gate
+        if: always()
+        run: |
+          set +x
+          set -uo pipefail
+          E="$RUNNER_TEMP/evidence"; OUT="$RUNNER_TEMP/secret_gate.txt"; : > "$OUT"
+          kn=0
+          if [ ! -s "$RUNNER_TEMP/maker.hex" ] || [ ! -s "$RUNNER_TEMP/taker.hex" ]; then kn=2; else
+            for key in "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/taker.hex"; do
+              if grep -R -F -q -f "$key" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err"; then kn=$((kn+1)); fi
+            done
+          fi
+          if [ "$kn" = 0 ]; then km=pass; else km=fail; fi
+          echo "check=client_key_exact_match result=$km count=$kn" >> "$OUT"
+          if [ ! -s "$RUNNER_TEMP/daemon.nsec" ] || grep -R -F -q -f "$RUNNER_TEMP/daemon.nsec" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err"; then r=fail; n=1; else r=pass; n=0; fi
+          echo "check=daemon_nsec_exact_match result=$r count=$n" >> "$OUT"
+          pat='nsec1|ncryptsec|BEGIN [A-Z ]*PRIVATE|macaroon|daemon\.nsec|maker\.hex|taker\.hex|NOSTR_SECRET_KEY|AgE[A-Za-z0-9+/]{40,}'
+          n=$({ grep -R -E -i -l -- "$pat" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" || true; } | wc -l); [ "$n" = 0 ] && r=pass || r=fail
+          echo "check=secret_pattern_files result=$r count=$n" >> "$OUT"
+          PY_RC=0
+          python3 - "$E" "$OUT" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/taker.pub" <<'PY' || PY_RC=$?
+          import json, os, re, sys
+          E,OUT=sys.argv[1:3]; pubs={open(p).read().strip().lower() for p in sys.argv[3:] if os.path.isfile(p) and os.path.getsize(p)}; hexrun=re.compile(r'[0-9a-fA-F]+')
+          eventfiles=('maker_neworder14.json','maker_ack14.json','taker_take_sell14.json','taker_add_invoice14.json','maker_waiting_buyer_invoice14.json','order38383.initial.json','order38383.updated.json')
+          ids=set(pubs); sigs=set(); texts=[]
+          for name in eventfiles:
+              path=os.path.join(E,name)
+              if not os.path.isfile(path): continue
+              ev=json.loads(open(path).read()); ids.update([ev['id'].lower(),ev['pubkey'].lower()]); sigs.add(ev['sig'].lower()); ev=dict(ev); ev.pop('content',None); texts.append(json.dumps(ev,sort_keys=True))
+          for name in ('maker_neworder.plain','maker_ack.plain','taker_take_sell.plain','taker_add_invoice14.plain','maker_waiting_buyer_invoice14.plain'):
+              path=os.path.join(E,name)
+              if not os.path.isfile(path): continue
+              texts.append(json.dumps(json.loads(open(path).read())[0],sort_keys=True))
+          violations=0
+          for text in texts:
+              for m in hexrun.finditer(text):
+                  h=m.group(0).lower()
+                  if len(h)<32 or (len(h)==64 and h in ids) or (len(h)==128 and h in sigs): continue
+                  violations+=1
+          r='pass' if violations==0 else 'fail'
+          with open(OUT,'a') as f: f.write(f'check=hex_run_allowlist result={r} count={violations}\n')
+          PY
+          if grep -q '^shape=preinvoice_handshake_ok$' "$RUNNER_TEMP/shape.txt" && grep -q '^shape=invoice_handshake_ok$' "$RUNNER_TEMP/invoice_shape.txt"; then r=pass; n=0; else r=fail; n=1; fi
+          echo "check=plaintext_shape_gate result=$r count=$n" >> "$OUT"
+          bad=$(ls "$E" | { grep -v -E '^(manifest\.txt|maker_neworder14\.(json|verify\.(stdout|stderr|rc))|maker_neworder\.plain|maker_ack14\.(id|json|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_ack\.plain|maker\.decrypt\.(stderr|rc)|taker_take_sell14\.(json|verify\.(stdout|stderr|rc))|taker_take_sell\.plain|taker\.decrypt\.(stderr|rc)|order38383\.(initial|updated|waitingpayment)\.(json|req\.(rc|stderr)|verify\.(stdout|stderr|rc))|order_id\.txt|taker_add_invoice_request14\.(json|verify\.(stdout|stderr|rc))|taker_add_invoice_request\.plain|maker_pay_invoice14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_waiting_seller_to_pay14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_add_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_waiting_buyer_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc)))$' || true; } | wc -l)
+          [ "$bad" = 0 ] && r=pass || r=fail
+          echo "check=unexpected_file_names result=$r count=$bad" >> "$OUT"
+          cat "$OUT"
+          gate_ok=1; [ "${PY_RC:-1}" = 0 ] || gate_ok=0
+          for n in client_key_exact_match daemon_nsec_exact_match secret_pattern_files hex_run_allowlist plaintext_shape_gate unexpected_file_names; do
+            grep -q "^check=$n result=pass count=[0-9][0-9]*$" "$OUT" || gate_ok=0
+          done
+          [ "$(grep -c '^check=' "$OUT")" = 6 ] || gate_ok=0
+          if [ "$gate_ok" = 1 ]; then echo 'gate=pass' >> "$GITHUB_OUTPUT"; else echo 'gate=fail' >> "$GITHUB_OUTPUT"; fi
+      - name: Strict complete-handshake artifact validation and sanitization
+        id: artifact_validation
+        if: always()
+        env:
+          HANDSHAKE_RESULT: ${{ steps.handshake_result.outputs.result }}
+          GATE_RESULT: ${{ steps.gate.outputs.gate }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/safe-artifact"
+          python3 - "$RUNNER_TEMP" "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/safe-artifact" "${GITHUB_RUN_ID:-}" "${HANDSHAKE_RESULT:-}" "${GATE_RESULT:-}" <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, sys
+          rt,e,out=map(pathlib.Path,sys.argv[1:4]); run_id,handshake,gate=sys.argv[4:]
+          output=pathlib.Path(os.environ['GITHUB_OUTPUT'])
+          if handshake!='PASS' or gate!='pass':
+              with output.open('a',encoding='utf-8') as f: f.write('ready=no\n')
+              print('artifact disabled: complete handshake and secret gate are both required')
+              raise SystemExit(0)
+          if not re.fullmatch(r'[0-9]+',run_id): raise ValueError('invalid run id')
+          shape=(rt/'shape.txt').read_text(encoding='utf-8').splitlines()
+          if not shape or shape[0]!='shape=preinvoice_handshake_ok': raise ValueError('full validated shape is required')
+          order_id=(rt/'order_id.txt').read_text(encoding='utf-8').strip().lower()
+          hex64=re.compile(r'^[0-9a-f]{64}$'); hex128=re.compile(r'^[0-9a-f]{128}$')
+          uuid_re=re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          if not uuid_re.fullmatch(order_id): raise ValueError('invalid correlated order id')
+          def read_key(name):
+              p=rt/name
+              if p.is_symlink() or not p.is_file(): raise ValueError('missing/unsafe '+name)
+              v=p.read_text(encoding='ascii').strip().lower()
+              if not hex64.fullmatch(v): raise ValueError('invalid public key '+name)
+              return v
+          daemon,maker,taker=(read_key('daemon.pub'),read_key('maker.pub'),read_key('taker.pub'))
+          if maker==taker: raise ValueError('maker and taker keys must differ')
+          def unique(pairs):
+              obj={}
+              for key,value in pairs:
+                  if key in obj: raise ValueError('duplicate JSON key: '+key)
+                  obj[key]=value
+              return obj
+          def load_json(path,max_bytes=262144):
+              if path.is_symlink() or not path.is_file() or path.stat().st_size<1 or path.stat().st_size>max_bytes:
+                  raise ValueError('missing/unsafe JSON file: '+path.name)
+              return json.loads(path.read_text(encoding='utf-8'),object_pairs_hook=unique)
+          unsafe_text=re.compile(r'(?i)(?:lnbc1|lntb1|lnbcrt1|lnsb1|lnurl|nsec1|cashu[a-z0-9]|payment[_-]?request|macaroon|preimage)')
+          def scan_strings(value):
+              if isinstance(value,dict):
+                  for key,item in value.items():
+                      if key.lower() in {'cashu_escrow_token','cashu_escrow_locked_at','preimage','payment_hash','invoice','bolt11'}:
+                          raise ValueError('unsafe protocol field: '+key)
+                      scan_strings(item)
+              elif isinstance(value,list):
+                  for item in value: scan_strings(item)
+              elif isinstance(value,str) and unsafe_text.search(value):
+                  raise ValueError('unsafe invoice/payment/secret-like content')
+          bolt11_re=re.compile(r'^lnbcrt1[02-9ac-hj-np-z]{50,2000}$')
+          invoice_hashes={}
+          def redact(value):
+              if isinstance(value,dict):
+                  out={}
+                  for key,item in value.items():
+                      if key=='payment_request' and isinstance(item,list) and len(item)==3 and isinstance(item[1],str):
+                          out[key]=[redact(item[0]),'<redacted>',redact(item[2])]
+                      else:
+                          out[key]=redact(item)
+                  return out
+              if isinstance(value,list):
+                  return [redact(v) for v in value]
+              return value
+          small_keys={'id','kind','status','amount','fiat_code','min_amount','max_amount','fiat_amount','payment_method','premium','buyer_trade_pubkey','seller_trade_pubkey','buyer_invoice','created_at','expires_at','cashu_mint_url'}
+          required_small={'kind','amount','fiat_code','fiat_amount','payment_method','premium'}
+          def check_small(small,expected_id=None,expected_status=None,request=False):
+              if not isinstance(small,dict) or set(small)-small_keys or required_small-set(small): raise ValueError('unexpected/incomplete SmallOrder fields')
+              if small['kind']!='sell' or small['fiat_code']!='USD' or small['fiat_amount']!=10 or small['amount']!=1000 or small['premium']!=0 or small['payment_method']!='BANK_TRANSFER':
+                  raise ValueError('unexpected order data')
+              for field in ('amount','fiat_amount','premium'):
+                  if not isinstance(small[field],int) or isinstance(small[field],bool): raise ValueError('invalid numeric order field: '+field)
+              if small.get('buyer_invoice') is not None or small.get('cashu_mint_url') is not None: raise ValueError('invoice/Cashu field is present')
+              if expected_id is not None and small.get('id')!=expected_id: raise ValueError('order id mismatch')
+              if expected_status is not None and small.get('status')!=expected_status: raise ValueError('order status mismatch')
+              for field in ('min_amount','max_amount','created_at','expires_at'):
+                  if field in small and small[field] is not None and (not isinstance(small[field],int) or isinstance(small[field],bool)): raise ValueError('invalid '+field)
+              for field in ('buyer_trade_pubkey','seller_trade_pubkey'):
+                  if field in small and small[field] is not None and (not isinstance(small[field],str) or len(small[field])>128): raise ValueError('invalid '+field)
+              scan_strings(small)
+          specifications=(
+              ('maker_neworder.plain','new-order',101,None,'new'),
+              ('maker_ack.plain','new-order',101,order_id,'ack'),
+              ('taker_take_sell.plain','take-sell',202,order_id,'take'),
+              ('taker_add_invoice14.plain','add-invoice',202,order_id,'add'),
+              ('maker_waiting_buyer_invoice14.plain','waiting-buyer-invoice',202,order_id,'wait'),
+              ('taker_add_invoice_request.plain','add-invoice',203,order_id,'invreq'),
+              ('maker_pay_invoice14.plain','pay-invoice',203,order_id,'payinv'),
+              ('taker_waiting_seller_to_pay14.plain','waiting-seller-to-pay',203,order_id,'waitpeer'),
+          )
+          for filename,action,request_id,expected_id,role in specifications:
+              wrapped=load_json(e/filename,65536)
+              if not isinstance(wrapped,list) or len(wrapped)!=3 or wrapped[1:]!=[None,None] or not isinstance(wrapped[0],dict) or set(wrapped[0])!={'order'}:
+                  raise ValueError('unexpected message wrapper: '+filename)
+              msg=wrapped[0]['order']; common={'version','request_id','trade_index','id','action','payload'}
+              required={'version','request_id','action','payload'}
+              if not isinstance(msg,dict) or set(msg)-common or required-set(msg): raise ValueError('unexpected message fields: '+filename)
+              if msg['version']!=2 or msg['request_id']!=request_id or msg['action']!=action: raise ValueError('unexpected message action/correlation: '+filename)
+              if 'trade_index' in msg and msg['trade_index'] is not None and (not isinstance(msg['trade_index'],int) or isinstance(msg['trade_index'],bool)): raise ValueError('invalid trade index')
+              if role=='new':
+                  if msg.get('id') is not None or not isinstance(msg['payload'],dict) or set(msg['payload'])!={'order'}: raise ValueError('unexpected NewOrder envelope')
+                  small=msg['payload']['order']
+                  if not isinstance(small,dict) or set(small)!={'kind','fiat_code','fiat_amount','amount','payment_method','premium'}: raise ValueError('unexpected NewOrder fields')
+                  check_small(small,request=True)
+              elif role in ('ack','add'):
+                  if msg.get('id')!=expected_id or not isinstance(msg['payload'],dict) or set(msg['payload'])!={'order'}: raise ValueError('unexpected order response envelope')
+                  check_small(msg['payload']['order'],expected_id, 'waiting-buyer-invoice' if role=='add' else 'pending')
+              elif role=='invreq':
+                  if msg.get('id')!=expected_id or not isinstance(msg['payload'],dict) or set(msg['payload'])!={'payment_request'}: raise ValueError('unexpected AddInvoice request envelope')
+                  pr=msg['payload']['payment_request']
+                  if not isinstance(pr,list) or len(pr)!=3 or pr[0] is not None or pr[2] is not None: raise ValueError('unexpected AddInvoice payload')
+                  if not isinstance(pr[1],str) or not bolt11_re.fullmatch(pr[1]): raise ValueError('invalid payout invoice')
+                  invoice_hashes['payout']=hashlib.sha256(pr[1].encode()).hexdigest()
+              elif role=='payinv':
+                  if msg.get('id')!=expected_id or not isinstance(msg['payload'],dict) or set(msg['payload'])!={'payment_request'}: raise ValueError('unexpected PayInvoice envelope')
+                  pr=msg['payload']['payment_request']
+                  if not isinstance(pr,list) or len(pr)!=3 or pr[2] is not None: raise ValueError('unexpected PayInvoice payload')
+                  if not isinstance(pr[1],str) or not bolt11_re.fullmatch(pr[1]): raise ValueError('invalid hold invoice')
+                  invoice_hashes['hold']=hashlib.sha256(pr[1].encode()).hexdigest()
+                  check_small(pr[0],expected_id,'waiting-payment')
+              elif role=='waitpeer':
+                  if msg.get('id')!=expected_id or msg['payload'] is not None: raise ValueError('unexpected WaitingSellerToPay payload')
+              else:
+                  if msg.get('id')!=expected_id or msg['payload'] is not None: raise ValueError('unexpected payload/id: '+filename)
+              scan_strings(redact(msg))
+          event_specs=(
+              ('maker_neworder14.json',14,maker,daemon,None,None,None),
+              ('maker_ack14.json',14,daemon,maker,None,None,None),
+              ('taker_take_sell14.json',14,taker,daemon,None,None,None),
+              ('taker_add_invoice14.json',14,daemon,taker,None,None,None),
+              ('maker_waiting_buyer_invoice14.json',14,daemon,maker,None,None,None),
+              ('order38383.initial.json',38383,daemon,None,order_id,'pending',None),
+              ('order38383.updated.json',38383,daemon,None,order_id,'in-progress','sell'),
+              ('taker_add_invoice_request14.json',14,taker,daemon,None,None,None),
+              ('maker_pay_invoice14.json',14,daemon,maker,None,None,None),
+              ('taker_waiting_seller_to_pay14.json',14,daemon,taker,None,None,None),
+              ('order38383.waitingpayment.json',38383,daemon,None,order_id,'waiting-payment','sell'),
+          )
+          receipts=[]
+          for filename,kind,author,recipient,oid,status,order_kind in event_specs:
+              ev=load_json(e/filename)
+              if not isinstance(ev,dict) or set(ev)!={'id','pubkey','created_at','kind','tags','content','sig'}: raise ValueError('unexpected Nostr event fields: '+filename)
+              if not isinstance(ev['id'],str) or not isinstance(ev['pubkey'],str) or not isinstance(ev['sig'],str) or not hex64.fullmatch(ev['id']) or not hex64.fullmatch(ev['pubkey']) or not hex128.fullmatch(ev['sig']): raise ValueError('invalid Nostr identifier/signature: '+filename)
+              if ev['kind']!=kind or ev['pubkey']!=author or not isinstance(ev['created_at'],int) or isinstance(ev['created_at'],bool): raise ValueError('unexpected event identity: '+filename)
+              if not isinstance(ev['content'],str) or len(ev['content'])>131072 or any(ord(c)<32 and c not in '\t' for c in ev['content']): raise ValueError('invalid event content field: '+filename)
+              tags=ev['tags']
+              if not isinstance(tags,list) or len(tags)>64: raise ValueError('invalid event tags: '+filename)
+              for tag in tags:
+                  if not isinstance(tag,list) or len(tag)<2 or len(tag)>8 or any(not isinstance(x,str) or len(x)>512 or any(ord(c)<32 for c in x) for x in tag): raise ValueError('invalid tag structure: '+filename)
+              receipt={'name':filename,'id':ev['id'],'pubkey':ev['pubkey'],'created_at':ev['created_at'],'kind':kind,'sig':ev['sig'],'recipient':recipient,'order_id':oid,'status':status,'order_kind':order_kind,'content_sha256':hashlib.sha256(ev['content'].encode()).hexdigest()}
+              if kind==14:
+                  p_tags=[tag[1:] for tag in tags if tag[0]=='p']
+                  exp_tags=[tag[1:] for tag in tags if tag[0]=='expiration']
+                  other_tags=[tag for tag in tags if tag[0] not in ('p','expiration')]
+                  if p_tags!=[[recipient]] or other_tags or len(exp_tags)>1: raise ValueError('unexpected kind-14 tags: '+filename)
+                  if exp_tags and (len(exp_tags[0])!=1 or not re.fullmatch(r'[0-9]{1,12}',exp_tags[0][0]) or int(exp_tags[0][0])<=0): raise ValueError('invalid kind-14 expiration tag: '+filename)
+              else:
+                  for key in ('d','s')+ (('k',) if filename.endswith(('.updated.json','.waitingpayment.json')) else ()):
+                      selected=[tag for tag in tags if tag[0]==key]
+                      expected={'d':oid,'s':status,'k':'sell'}[key]
+                      if selected!=[[key,expected]]: raise ValueError('unexpected kind-38383 '+key+' tag: '+filename)
+                  if filename.endswith('.initial.json'):
+                      selected_k=[tag for tag in tags if tag[0]=='k']
+                      if selected_k not in ([],[['k','sell']]): raise ValueError('unexpected initial order-kind tag')
+                      if selected_k: receipt['order_kind']='sell'
+                  if ev['content']!='': raise ValueError('kind-38383 content must be empty')
+                  for tag in tags:
+                      if any(word in tag[0].lower() for word in ('invoice','payment','cashu','bond','preimage','secret')): raise ValueError('unsafe order-event tag')
+              rcname=filename.replace('.json','.verify.rc')
+              rcpath=e/rcname
+              if rcpath.is_symlink() or not rcpath.is_file() or rcpath.read_text(encoding='ascii').strip()!='0': raise ValueError('event verification missing/failing: '+filename)
+              receipts.append(receipt)
+          manifest={'schema':'phase4h-safe-evidence-v1','run_id':run_id,'source':{'satonero':'2534f8b0f05ade36007445511e02747f4468109a','regtest':'c6adbdaaaf0a2152a0728dbce6adf11945f547bd','nak':'v0.22.2'},'handshake':'PASS','secret_gate':'pass','order_id':order_id,'maker_pubkey':maker,'taker_pubkey':taker,'actions':['new-order','take-sell','add-invoice'],'limits':{'new_order':1,'take_sell':1,'add_invoice':1,'retries':0,'payments':0,'channels':0,'invoices':1,'bonds':0,'cashu':0},'invoice_sha256':{'payout':invoice_hashes.get('payout'),'hold':invoice_hashes.get('hold')}}
+          shutil.rmtree(out,ignore_errors=True); out.mkdir(mode=0o700,parents=True)
+          (out/'manifest.json').write_text(json.dumps(manifest,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8')
+          (out/'events.json').write_text(json.dumps(receipts,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8')
+          if {p.name for p in out.iterdir()}!={'manifest.json','events.json'} or any(p.is_symlink() or not p.is_file() for p in out.iterdir()): raise ValueError('unexpected artifact output')
+          check_manifest=load_json(out/'manifest.json'); check_events=load_json(out/'events.json')
+          if check_manifest!=manifest or set(check_manifest)!={'schema','run_id','source','handshake','secret_gate','order_id','maker_pubkey','taker_pubkey','actions','limits','invoice_sha256'} or check_events!=receipts or not isinstance(check_events,list) or len(check_events)!=11: raise ValueError('sanitized artifact validation failed')
+          if not manifest['invoice_sha256']['payout'] or not manifest['invoice_sha256']['hold'] or manifest['invoice_sha256']['payout']==manifest['invoice_sha256']['hold']: raise ValueError('invoice receipts missing or identical')
+          if any('lnbcrt1' in p.read_text(encoding='utf-8') for p in out.iterdir()): raise ValueError('invoice string leaked into artifact')
+          if any(set(item)!={'name','id','pubkey','created_at','kind','sig','recipient','order_id','status','order_kind','content_sha256'} for item in check_events): raise ValueError('unexpected sanitized event fields')
+          with output.open('a',encoding='utf-8') as f: f.write('ready=yes\n')
+          print('strict artifact validation passed; only manifest.json and content-hash event receipts are publishable')
+          PY
+      - name: Upload policy
+        id: policy
+        if: always()
+        env:
+          HANDSHAKE_RESULT: ${{ steps.handshake_result.outputs.result }}
+          GATE_RESULT: ${{ steps.gate.outputs.gate }}
+          ARTIFACT_OUTCOME: ${{ steps.artifact_validation.outcome }}
+          ARTIFACT_READY: ${{ steps.artifact_validation.outputs.ready }}
+          INVOICE_OUTCOME: ${{ steps.invoice_validation.outcome }}
+          NOPAY_OUTCOME: ${{ steps.no_payment_gate.outcome }}
+        run: |
+          set -euo pipefail
+          upload=no
+          if [ "$HANDSHAKE_RESULT" = PASS ] && [ "$GATE_RESULT" = pass ] && [ "$ARTIFACT_OUTCOME" = success ] && [ "$ARTIFACT_READY" = yes ] && [ "$INVOICE_OUTCOME" = success ] && [ "$NOPAY_OUTCOME" = success ]; then upload=yes; fi
+          echo "upload=$upload" >> "$GITHUB_OUTPUT"
+      - name: Upload evidence artifact
+        id: upload_evidence
+        if: steps.policy.outputs.upload == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4h-takesell-evidence
+          path: ${{ runner.temp }}/safe-artifact
+          retention-days: 1
+          if-no-files-found: error
+      - name: Verdict
+        if: always()
+        env:
+          HANDSHAKE_RESULT: ${{ steps.handshake_result.outputs.result }}
+          GATE_RESULT: ${{ steps.gate.outputs.gate }}
+          ARTIFACT_OUTCOME: ${{ steps.artifact_validation.outcome }}
+          ARTIFACT_READY: ${{ steps.artifact_validation.outputs.ready }}
+          POLICY_OUTCOME: ${{ steps.policy.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload_evidence.outcome }}
+          INVOICE_OUTCOME: ${{ steps.invoice_validation.outcome }}
+          NOPAY_OUTCOME: ${{ steps.no_payment_gate.outcome }}
+        run: |
+          set +x
+          gate=${GATE_RESULT:-missing}
+          handshake=${HANDSHAKE_RESULT:-INCONCLUSIVE}
+          printf 'HANDSHAKE_RESULT=%s SECRET_GATE=%s\n' "$handshake" "$gate"
+          if [ "$gate" != pass ]; then echo 'FAIL: secret gate'; exit 1; fi
+          if [ "$handshake" != PASS ]; then echo "${handshake}: handshake did not complete successfully"; exit 1; fi
+          if [ "${ARTIFACT_OUTCOME:-}" != success ] || [ "${ARTIFACT_READY:-}" != yes ]; then echo 'FAIL: strict artifact validation did not pass'; exit 1; fi
+          if [ "${POLICY_OUTCOME:-}" != success ] || [ "${UPLOAD_OUTCOME:-}" != success ]; then echo 'FAIL: artifact policy/upload did not complete'; exit 1; fi
+          if [ "${INVOICE_OUTCOME:-}" != success ] || [ "${NOPAY_OUTCOME:-}" != success ]; then echo 'FAIL: invoice validation or no-payment gate did not pass'; exit 1; fi
+          echo 'SUCCESS: one NewOrder, one TakeSell, one AddInvoice, hold-invoice PayInvoice, WaitingSellerToPay and waiting-payment order event correlated; no funds moved; artifact validated'
+      - name: Cleanup (always)
+        if: always()
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
+          if [ -n "$cid" ]; then docker exec "$cid" sh -c 'rm -f /tmp/maker.hex /tmp/taker.hex /tmp/maker.sh /tmp/taker.sh /tmp/addinvoice.sh /tmp/taker_invoice.txt /tmp/order.initial.json /tmp/order.updated.json /tmp/mk.ev /tmp/tk.ev /tmp/mk.plain /tmp/tk.plain; rm -rf /tmp/evidence /tmp/*.cand /tmp/*.seen /tmp/*.err /tmp/*.out' || true; fi
+          rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/safe-artifact" "$RUNNER_TEMP/handshake_result.txt" "$RUNNER_TEMP/invoice_shape.txt" "$RUNNER_TEMP/taker_invoice.txt" "$RUNNER_TEMP/addinvoice.sh" "$RUNNER_TEMP/addinvoice.out" "$RUNNER_TEMP/addinvoice.err" "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/taker.hex" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/taker.pub" "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/taker.sh" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/shape.txt" "$RUNNER_TEMP/secret_gate.txt" || true
+          docker rm -f satonero-daemon >/dev/null 2>&1 || true
+          docker volume rm satonero-config >/dev/null 2>&1 || true
+          docker compose down -v || true
+          docker system prune -af --volumes || true
+          cleanup_failed=0
+          verify_absent() {
+            label=$1; shift
+            if output=$("$@" 2>/dev/null); then
+              if [ -z "$output" ]; then echo "absence confirmed: $label"; else echo "resource remains: $label"; cleanup_failed=1; fi
+            else
+              rc=$?; echo "inspection failed: $label rc=$rc"; cleanup_failed=1
+            fi
+          }
+          verify_absent 'satonero daemon containers' docker ps -a -q --filter name=satonero-daemon
+          verify_absent 'satonero config volumes' docker volume ls -q --filter name=satonero-config
+          verify_absent 'regtest containers' docker ps -a -q --filter name=mostro-regtest-
+          verify_absent 'regtest volumes' docker volume ls -q --filter name=mostro-regtest_
+          if python3 - "$RUNNER_TEMP" <<'PY'
+          import os, pathlib, sys
+          root=pathlib.Path(sys.argv[1])
+          names=('maker.hex','taker.hex','daemon.nsec','maker.pub','taker.pub','daemon.pub','settings.toml','maker.sh','taker.sh','addinvoice.sh','maker.out','maker.err','taker.out','taker.err','addinvoice.out','addinvoice.err','taker_invoice.txt','order_id.txt','shape.txt','invoice_shape.txt','handshake_result.txt','secret_gate.txt','evidence','safe-artifact')
+          try:
+              root.lstat()
+              left=[]
+              for name in names:
+                  try: (root/name).lstat()
+                  except FileNotFoundError: continue
+                  left.append(name)
+          except OSError as exc:
+              print('runner-temp inspection failed: '+str(exc)); raise SystemExit(2)
+          if left:
+              print('runner-temp resources remain: '+','.join(left)); raise SystemExit(1)
+          print('runner-temp absence confirmed')
+          PY
+          then echo 'runner-temp absence confirmed'; else rc=$?; echo "runner-temp inspection/absence failed rc=$rc"; cleanup_failed=1; fi
+          if [ "$cleanup_failed" = 0 ]; then echo 'CLEANUP VERIFIED'; else echo 'CLEANUP NOT VERIFIED'; exit 1; fi
