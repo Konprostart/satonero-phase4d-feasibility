@@ -56,6 +56,10 @@ jobs:
           python3 - <<'PY'
           p = "docker/nostr_relay/Dockerfile"
           lines = open(p, encoding="utf-8").read().split("\n")
+          old, new = "apt-get install -y curl gosu", "apt-get install -y curl gosu jq"
+          hits = [n for n, line in enumerate(lines) if old in line]
+          assert len(hits) == 1, hits
+          lines[hits[0]] = lines[hits[0]].replace(old, new)
           i = [n for n, line in enumerate(lines) if line.startswith("RUN BIN_URL=$(curl -s https://api.github.com/repos/fiatjaf/nak/releases/latest")]
           assert len(i) == 1, i
           i = i[0]
@@ -70,7 +74,7 @@ jobs:
           ]
           open(p, "w", encoding="utf-8").write("\n".join(lines))
           PY
-          test "$(sha256sum "$f" | cut -d' ' -f1)" = "b5b35e3d596f26552c42a63ac13134722a8924c7fca451e43ab221e3368ed00e"
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "ab32f22df3de0185ac04d75b5269d532127557abcad3f89180a63e9032402cb3"
           f=docker-compose.yml
           test "$(sha256sum "$f" | cut -d' ' -f1)" = "ac08e210765c0c95cd255be2045127f595b3da8d66a27288a4b254ff8b71ea4d"
           python3 - <<'PY'
@@ -101,6 +105,11 @@ jobs:
             sleep 10
           done
           echo "FAIL: regtest healthchecks not all healthy"; exit 1
+      - name: Verify jq is available in the relay container
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          docker compose exec -T nostr_relay jq --version
       - name: Generate disposable daemon key and assert pre-invoice settings
         working-directory: satonero
         run: |
