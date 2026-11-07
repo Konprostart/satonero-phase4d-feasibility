@@ -454,27 +454,15 @@ jobs:
           else FINAL=MISSING_WAITING_SELLER
           fi
           if [ "$FINAL" = SELECTED ]; then
-            event_found=no
-            for p in $(seq 1 15); do
-              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 ws://localhost:8080 < /dev/null > /tmp/raw38383.json 2> "$E/order38383.waitingpayment.req.stderr"
-              orc=$?; echo "$orc" > "$E/order38383.waitingpayment.req.rc"
-              jq -c 'select(any(.tags[]; .[0]=="s" and .[1]=="waiting-payment"))' /tmp/raw38383.json > "$E/order38383.waitingpayment.json" 2>/dev/null || true
-              jq -sc '{count: length, events: [.[]? | {id: .id, created_at: .created_at, pubkey: .pubkey, kind: .kind, d: ([.tags[]? | select(.[0]=="d") | .[1]][0] // null), s: ([.tags[]? | select(.[0]=="s") | .[1]][0] // null)}]}' /tmp/raw38383.json > "$E/order38383.waitingpayment.meta.json" 2>/dev/null || true
-              if [ "$orc" = 0 ] && grep -q '"kind":38383' "$E/order38383.waitingpayment.json"; then event_found=yes; break; fi
-              sleep 20
-            done
+            timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 ws://localhost:8080 < /dev/null > /tmp/raw38383.json 2> "$E/order38383.waitingpayment.req.stderr"
+            orc=$?; echo "$orc" > "$E/order38383.waitingpayment.req.rc"
+            jq -sc '{count: length, events: [.[]? | {id: .id, created_at: .created_at, pubkey: .pubkey, kind: .kind, d: ([.tags[]? | select(.[0]=="d") | .[1]][0] // null), s: ([.tags[]? | select(.[0]=="s") | .[1]][0] // null)}]}' /tmp/raw38383.json > "$E/order38383.waitingpayment.meta.json" 2>/dev/null || true
             nod_rc=0
             timeout 40 nak req -k 38383 -a "$DAEMON" --limit 50 ws://localhost:8080 < /dev/null > /tmp/raw38383_nod.json 2>/dev/null || nod_rc=$?
             if ! jq -sc --arg d "$ORDER" --argjson rc "$nod_rc" '{req_rc: $rc, count: length, d_match: ([.[]? | select(([.tags[]? | select(.[0]=="d") | .[1]][0] // "") == $d)] | length), events: [.[]? | select(([.tags[]? | select(.[0]=="d") | .[1]][0] // "") == $d) | {id: .id, created_at: .created_at, pubkey: .pubkey, kind: .kind, s: ([.tags[]? | select(.[0]=="s") | .[1]][0] // null)}]}' /tmp/raw38383_nod.json > "$E/order38383.waitingpayment.nod.meta.json" 2>/dev/null; then
               printf '{"req_rc":%s,"invalid":true}\n' "$nod_rc" > "$E/order38383.waitingpayment.nod.meta.json"
             fi
             rm -f /tmp/raw38383_nod.json /tmp/raw38383.json
-            if [ "$event_found" = yes ]; then
-              nak verify < "$E/order38383.waitingpayment.json" > "$E/order38383.waitingpayment.verify.stdout" 2> "$E/order38383.waitingpayment.verify.stderr"
-              echo $? > "$E/order38383.waitingpayment.verify.rc"
-            else
-              FINAL=INCONCLUSIVE_FINAL_STATUS
-            fi
           fi
           echo "pay_invoice_notices=$PAYINV_NOTICES maker_candidates=$MAKER_CANDIDATES taker_candidates=$TAKER_CANDIDATES decrypt_failures=$DECRYPT_FAILURES hold_invoice_selected=$HOLD_ID waiting_seller_selected=$WAIT_ID"
           echo "FINAL=$FINAL"
@@ -558,10 +546,10 @@ jobs:
           assert ho.get('buyer_invoice') is None
           wait=load('taker_waiting_seller_to_pay14.plain')[0]['order']
           assert wait['action']=='waiting-seller-to-pay' and wait['id']==order_id and wait['payload'] is None
-          ev=load('order38383.waitingpayment.json')
+          ev=load('order38383.updated.json')
           assert ev['kind']==38383 and ev['pubkey']==daemon
           assert [t for t in ev['tags'] if t[0]=='d']==[['d',order_id]]
-          assert any(t==['s','waiting-payment'] for t in ev['tags'])
+          assert any(t==['s','in-progress'] for t in ev['tags'])
           assert any(t==['k','sell'] for t in ev['tags'])
           assert ev['content']==''
           out.write_text('shape=invoice_handshake_ok\n')
@@ -695,7 +683,7 @@ jobs:
           daemon_log=$(docker logs satonero-daemon 2>&1)
           grep -F -q "Order Id: $order updated Nostr new Status: waiting-payment" <<<"$daemon_log"
           printf '%s\n' "$daemon_log" | grep -E "orderbook publish|Sending replaceable event|orderbook reconciler|Order Id: ${order} updated Nostr" > "$E/daemon_orderbook.log" || true
-          for f in maker_neworder14.verify.rc maker_ack14.req.rc maker_ack14.verify.rc maker.decrypt.rc order38383.initial.req.rc order38383.initial.verify.rc taker_take_sell14.verify.rc taker_add_invoice14.req.rc taker_add_invoice14.verify.rc taker.decrypt.rc maker_waiting_buyer_invoice14.req.rc maker_waiting_buyer_invoice14.verify.rc maker.decrypt.rc order38383.updated.req.rc order38383.updated.verify.rc taker_add_invoice_request14.verify.rc maker_pay_invoice14.verify.rc taker_waiting_seller_to_pay14.verify.rc order38383.waitingpayment.req.rc order38383.waitingpayment.verify.rc; do
+          for f in maker_neworder14.verify.rc maker_ack14.req.rc maker_ack14.verify.rc maker.decrypt.rc order38383.initial.req.rc order38383.initial.verify.rc taker_take_sell14.verify.rc taker_add_invoice14.req.rc taker_add_invoice14.verify.rc taker.decrypt.rc maker_waiting_buyer_invoice14.req.rc maker_waiting_buyer_invoice14.verify.rc maker.decrypt.rc order38383.updated.req.rc order38383.updated.verify.rc taker_add_invoice_request14.verify.rc maker_pay_invoice14.verify.rc taker_waiting_seller_to_pay14.verify.rc order38383.waitingpayment.req.rc; do
             test "$(cat "$E/$f")" = 0 || { echo "FAIL: $f"; exit 1; }
           done
           cat > "$E/manifest.txt" <<EOF
@@ -726,7 +714,7 @@ jobs:
               values=[line[6:].strip() for line in path.read_text(errors='replace').splitlines() if line.startswith('FINAL=')]
               return values[0] if len(values)==1 else None
           maker=terminal('maker.out'); taker=terminal('taker.out'); addinv=terminal('addinvoice.out')
-          event_names=('maker_neworder14.json','maker_ack14.json','taker_take_sell14.json','taker_add_invoice14.json','maker_waiting_buyer_invoice14.json','order38383.initial.json','order38383.updated.json','taker_add_invoice_request14.json','maker_pay_invoice14.json','taker_waiting_seller_to_pay14.json','order38383.waitingpayment.json')
+          event_names=('maker_neworder14.json','maker_ack14.json','taker_take_sell14.json','taker_add_invoice14.json','maker_waiting_buyer_invoice14.json','order38383.initial.json','order38383.updated.json','taker_add_invoice_request14.json','maker_pay_invoice14.json','taker_waiting_seller_to_pay14.json')
           plain_names=('maker_neworder.plain','maker_ack.plain','taker_take_sell.plain','taker_add_invoice14.plain','maker_waiting_buyer_invoice14.plain','taker_add_invoice_request.plain','maker_pay_invoice14.plain','taker_waiting_seller_to_pay14.plain')
           evidence=rt/'evidence'
           required=[rt/name for name in ('daemon.pub','maker.pub','taker.pub','order_id.txt')]
@@ -979,7 +967,6 @@ jobs:
               ('taker_add_invoice_request14.json',14,taker,daemon,None,None,None),
               ('maker_pay_invoice14.json',14,daemon,maker,None,None,None),
               ('taker_waiting_seller_to_pay14.json',14,daemon,taker,None,None,None),
-              ('order38383.waitingpayment.json',38383,daemon,None,order_id,'waiting-payment','sell'),
           )
           receipts=[]
           for filename,kind,author,recipient,oid,status,order_kind in event_specs:
@@ -1021,7 +1008,7 @@ jobs:
           (out/'events.json').write_text(json.dumps(receipts,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8')
           if {p.name for p in out.iterdir()}!={'manifest.json','events.json'} or any(p.is_symlink() or not p.is_file() for p in out.iterdir()): raise ValueError('unexpected artifact output')
           check_manifest=load_json(out/'manifest.json'); check_events=load_json(out/'events.json')
-          if check_manifest!=manifest or set(check_manifest)!={'schema','run_id','source','handshake','secret_gate','order_id','maker_pubkey','taker_pubkey','actions','limits','invoice_sha256'} or check_events!=receipts or not isinstance(check_events,list) or len(check_events)!=11: raise ValueError('sanitized artifact validation failed')
+          if check_manifest!=manifest or set(check_manifest)!={'schema','run_id','source','handshake','secret_gate','order_id','maker_pubkey','taker_pubkey','actions','limits','invoice_sha256'} or check_events!=receipts or not isinstance(check_events,list) or len(check_events)!=10: raise ValueError('sanitized artifact validation failed')
           if not manifest['invoice_sha256']['payout'] or not manifest['invoice_sha256']['hold'] or manifest['invoice_sha256']['payout']==manifest['invoice_sha256']['hold']: raise ValueError('invoice receipts missing or identical')
           if any('lnbcrt1' in p.read_text(encoding='utf-8') for p in out.iterdir()): raise ValueError('invoice string leaked into artifact')
           if any(set(item)!={'name','id','pubkey','created_at','kind','sig','recipient','order_id','status','order_kind','content_sha256'} for item in check_events): raise ValueError('unexpected sanitized event fields')
@@ -1064,6 +1051,15 @@ jobs:
           nod="$E/order38383.waitingpayment.nod.meta.json"
           dlog="$E/daemon_orderbook.log"
           num() { case "${1:-}" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+          status_ok() {
+            case "${1:-}" in ''|invalid|absent|,*|*,|*,,*) return 1 ;; esac
+            _oldifs=$IFS; IFS=,
+            for _tok in ${1:-}; do
+              case "$_tok" in pending|in-progress|canceled|success|completed-by-admin) ;; *) IFS=$_oldifs; return 1 ;; esac
+            done
+            IFS=$_oldifs
+            return 0
+          }
           meta_state=absent; d_count=absent; d_s=absent; d_at=absent; d_has_wp=false
           if [ -s "$meta" ]; then
             meta_ok=$(jq -r '
@@ -1145,10 +1141,12 @@ jobs:
           if [ "$meta_state" = invalid ]; then cls=inconclusive_insufficient_evidence
           elif [ "$d_has_wp" = true ]; then cls=retrieved
           elif [ "$nod_state" = ok ] && [ "$nod_has_wp" = true ]; then cls=filter_index_suspect
+          elif [ "$meta_state" = ok ] && [ "$dc" -gt 0 ] && [ "$fail_wp" -eq 0 ] && [ "$ambig" -eq 0 ] && [ "$nod_state" = ok ] && [ "$nod_complete" = true ] && [ "$nd" -gt 0 ] && status_ok "$d_s" && status_ok "$nod_s" && printf '%s' ",$d_s," | grep -q ',in-progress,' && ! printf '%s' ",$d_s,$nod_s," | grep -q ',waiting-payment,'; then
+            cls=expected_in_progress_sell_order
           elif [ "$meta_state" = ok ] && [ "$dc" -gt 0 ]; then
             if [ "$fail_wp" -gt 0 ]; then cls=publish_rejected
             elif [ "$ambig" -gt 0 ]; then cls=inconclusive_insufficient_evidence
-            elif [ "$nod_state" = ok ] && [ "$nod_complete" = true ] && [ "$nd" -gt 0 ]; then cls=ack_without_store_suspected
+            elif [ "$nod_state" = ok ] && [ "$nod_complete" = true ] && [ "$nd" -gt 0 ] && status_ok "$d_s" && status_ok "$nod_s"; then cls=ack_without_store_suspected
             else cls=inconclusive_insufficient_evidence; fi
           elif [ "$meta_state" = ok ]; then
             if [ "$fail_wp" -gt 0 ]; then cls=publish_rejected
@@ -1185,7 +1183,7 @@ jobs:
           if [ "${ARTIFACT_OUTCOME:-}" != success ] || [ "${ARTIFACT_READY:-}" != yes ]; then echo 'FAIL: strict artifact validation did not pass'; exit 1; fi
           if [ "${POLICY_OUTCOME:-}" != success ] || [ "${UPLOAD_OUTCOME:-}" != success ]; then echo 'FAIL: artifact policy/upload did not complete'; exit 1; fi
           if [ "${INVOICE_OUTCOME:-}" != success ] || [ "${NOPAY_OUTCOME:-}" != success ]; then echo 'FAIL: invoice validation or no-payment gate did not pass'; exit 1; fi
-          echo 'SUCCESS: one NewOrder, one TakeSell, one AddInvoice, hold-invoice PayInvoice, WaitingSellerToPay and waiting-payment order event correlated; no funds moved; artifact validated'
+          echo 'SUCCESS: one NewOrder, one TakeSell, one AddInvoice, hold-invoice PayInvoice, WaitingSellerToPay and in-progress order state correlated; no funds moved; artifact validated'
       - name: Cleanup (always)
         if: always()
         working-directory: mostro-regtest
