@@ -454,7 +454,12 @@ jobs:
               if [ "$orc" = 0 ] && grep -q '"kind":38383' "$E/order38383.waitingpayment.json"; then event_found=yes; break; fi
               sleep 20
             done
-            rm -f /tmp/raw38383.json
+            nod_rc=0
+            timeout 40 nak req -k 38383 -a "$DAEMON" --limit 50 ws://localhost:8080 < /dev/null > /tmp/raw38383_nod.json 2>/dev/null || nod_rc=$?
+            if ! jq -sc --arg d "$ORDER" --argjson rc "$nod_rc" '{req_rc: $rc, count: length, d_match: ([.[]? | select(([.tags[]? | select(.[0]=="d") | .[1]][0] // "") == $d)] | length), events: [.[]? | select(([.tags[]? | select(.[0]=="d") | .[1]][0] // "") == $d) | {id: .id, created_at: .created_at, pubkey: .pubkey, kind: .kind, s: ([.tags[]? | select(.[0]=="s") | .[1]][0] // null)}]}' /tmp/raw38383_nod.json > "$E/order38383.waitingpayment.nod.meta.json" 2>/dev/null; then
+              printf '{"req_rc":%s,"invalid":true}\n' "$nod_rc" > "$E/order38383.waitingpayment.nod.meta.json"
+            fi
+            rm -f /tmp/raw38383_nod.json /tmp/raw38383.json
             if [ "$event_found" = yes ]; then
               nak verify < "$E/order38383.waitingpayment.json" > "$E/order38383.waitingpayment.verify.stdout" 2> "$E/order38383.waitingpayment.verify.stderr"
               echo $? > "$E/order38383.waitingpayment.verify.rc"
@@ -816,7 +821,7 @@ jobs:
           PY
           if grep -q '^shape=preinvoice_handshake_ok$' "$RUNNER_TEMP/shape.txt" && grep -q '^shape=invoice_handshake_ok$' "$RUNNER_TEMP/invoice_shape.txt"; then r=pass; n=0; else r=fail; n=1; fi
           echo "check=plaintext_shape_gate result=$r count=$n" >> "$OUT"
-          bad=$(ls "$E" | { grep -v -E '^(manifest\.txt|maker_neworder14\.(json|verify\.(stdout|stderr|rc))|maker_neworder\.plain|maker_ack14\.(id|json|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_ack\.plain|maker\.decrypt\.(stderr|rc)|taker_take_sell14\.(json|verify\.(stdout|stderr|rc))|taker_take_sell\.plain|taker\.decrypt\.(stderr|rc)|order38383\.(initial|updated|waitingpayment)\.(json|meta\.json|req\.(rc|stderr)|verify\.(stdout|stderr|rc))|daemon_orderbook\.log|order_id\.txt|taker_add_invoice_request14\.(json|verify\.(stdout|stderr|rc))|taker_add_invoice_request\.plain|maker_pay_invoice14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_waiting_seller_to_pay14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_add_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_waiting_buyer_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc)))$' || true; } | wc -l)
+          bad=$(ls "$E" | { grep -v -E '^(manifest\.txt|maker_neworder14\.(json|verify\.(stdout|stderr|rc))|maker_neworder\.plain|maker_ack14\.(id|json|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_ack\.plain|maker\.decrypt\.(stderr|rc)|taker_take_sell14\.(json|verify\.(stdout|stderr|rc))|taker_take_sell\.plain|taker\.decrypt\.(stderr|rc)|order38383\.(initial|updated|waitingpayment)\.(json|meta\.json|nod\.meta\.json|req\.(rc|stderr)|verify\.(stdout|stderr|rc))|daemon_orderbook\.log|order_id\.txt|taker_add_invoice_request14\.(json|verify\.(stdout|stderr|rc))|taker_add_invoice_request\.plain|maker_pay_invoice14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_waiting_seller_to_pay14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_add_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_waiting_buyer_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc)))$' || true; } | wc -l)
           [ "$bad" = 0 ] && r=pass || r=fail
           echo "check=unexpected_file_names result=$r count=$bad" >> "$OUT"
           cat "$OUT"
@@ -1038,6 +1043,118 @@ jobs:
           path: ${{ runner.temp }}/safe-artifact
           retention-days: 1
           if-no-files-found: error
+      - name: Kind-38383 publication diagnostic summary (counts only)
+        if: always()
+        continue-on-error: true
+        run: |
+          set +x
+          set -uo pipefail
+          E="$RUNNER_TEMP/evidence"
+          order=$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || echo none)
+          meta="$E/order38383.waitingpayment.meta.json"
+          nod="$E/order38383.waitingpayment.nod.meta.json"
+          dlog="$E/daemon_orderbook.log"
+          num() { case "${1:-}" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+          meta_state=absent; d_count=absent; d_s=absent; d_at=absent; d_has_wp=false
+          if [ -s "$meta" ]; then
+            meta_ok=$(jq -r '
+              def isint: (type=="number") and (floor==.);
+              def ev: (type=="object")
+                and ((.id|type)=="string") and (.id|test("^[0-9a-f]{64}\\z"))
+                and ((.pubkey|type)=="string") and (.pubkey|test("^[0-9a-f]{64}\\z"))
+                and ((.kind|type)=="number") and ((.kind|floor)==.kind) and (.kind>=0)
+                and ((has("s")|not) or (.s==null) or ((.s|type)=="string"))
+                and ((has("created_at")|not) or (.created_at==null) or ((.created_at|type)=="number"));
+              if (type=="object")
+                 and ((.count|isint) and (.count>=0))
+                 and ((.events|type)=="array")
+                 and (.count == (.events|length))
+                 and ([.events[]? | ev] | all)
+              then "1" else "0" end
+            ' "$meta" 2>/dev/null) || meta_ok=0
+            case "$meta_ok" in 1) meta_state=ok ;; *) meta_state=invalid ;; esac
+            d_count=$(jq -r 'if (.count|type)=="number" then (.count|floor|tostring) else "invalid" end' "$meta" 2>/dev/null) || d_count=invalid
+            d_s=$(jq -r '[.events[]? | select(type=="object") | .s | select(.!=null) | tostring | .[0:48] | gsub("[^A-Za-z0-9._-]";"_")] | unique | .[0:8] | join(",")' "$meta" 2>/dev/null) || d_s=invalid
+            d_at=$(jq -r '[.events[]? | select(type=="object") | .created_at | select((type=="number") and (floor==.)) | tostring] | .[0:8] | join(",")' "$meta" 2>/dev/null) || d_at=invalid
+            if [ "$meta_state" = ok ]; then
+              d_wp=$(jq -r '[.events[]? | .s] | any(. == "waiting-payment")' "$meta" 2>/dev/null) || d_wp=false
+              [ "$d_wp" = true ] && d_has_wp=true
+            fi
+          elif [ -e "$meta" ]; then meta_state=invalid
+          fi
+          nod_state=absent; nod_rc=absent; nod_count=absent; nod_dmatch=absent; nod_s=absent; nod_has_wp=false
+          if [ -s "$nod" ]; then
+            nod_ok=$(jq -r '
+              def isint: (type=="number") and (floor==.);
+              def ev: (type=="object")
+                and ((.id|type)=="string") and (.id|test("^[0-9a-f]{64}\\z"))
+                and ((.pubkey|type)=="string") and (.pubkey|test("^[0-9a-f]{64}\\z"))
+                and ((.kind|type)=="number") and ((.kind|floor)==.kind) and (.kind>=0)
+                and ((has("s")|not) or (.s==null) or ((.s|type)=="string"))
+                and ((has("created_at")|not) or (.created_at==null) or ((.created_at|type)=="number"));
+              if (type=="object")
+                 and ((.req_rc|isint) and (.req_rc==0))
+                 and ((.count|isint) and (.count>=0))
+                 and ((.d_match|isint) and (.d_match>=0) and (.d_match<=.count))
+                 and ((.events|type)=="array")
+                 and (.d_match == (.events|length))
+                 and ([.events[]? | ev] | all)
+              then "1" else "0" end
+            ' "$nod" 2>/dev/null) || nod_ok=0
+            case "$nod_ok" in 1) nod_state=ok ;; *) nod_state=invalid ;; esac
+            nod_rc=$(jq -r 'if (.req_rc|type)=="number" then (.req_rc|floor|tostring) else "invalid" end' "$nod" 2>/dev/null) || nod_rc=invalid
+            nod_count=$(jq -r 'if (.count|type)=="number" then (.count|floor|tostring) else "invalid" end' "$nod" 2>/dev/null) || nod_count=invalid
+            nod_dmatch=$(jq -r 'if (.d_match|type)=="number" then (.d_match|floor|tostring) else "invalid" end' "$nod" 2>/dev/null) || nod_dmatch=invalid
+            nod_s=$(jq -r '[.events[]? | select(type=="object") | .s | select(.!=null) | tostring | .[0:48] | gsub("[^A-Za-z0-9._-]";"_")] | unique | .[0:8] | join(",")' "$nod" 2>/dev/null) || nod_s=invalid
+            if [ "$nod_state" = ok ]; then
+              n_wp=$(jq -r '[.events[]? | .s] | any(. == "waiting-payment")' "$nod" 2>/dev/null) || n_wp=false
+              [ "$n_wp" = true ] && nod_has_wp=true
+            fi
+          elif [ -e "$nod" ]; then nod_state=invalid
+          fi
+          if [ -s "$dlog" ]; then
+            fail_wp=$(grep -c -F -- "for order $order (status waiting-payment)" "$dlog" 2>/dev/null || true)
+            fail_total=$(grep -c -F -- "for order $order (status " "$dlog" 2>/dev/null || true)
+            pubfail=$(grep -c -F -- "orderbook publish failed for order $order:" "$dlog" 2>/dev/null || true)
+            recwarn=$(grep -c -E -- "orderbook reconciler:.*$order" "$dlog" 2>/dev/null || true)
+            statusseen=$(grep -c -F -- "Order Id: $order updated Nostr new Status: waiting-payment" "$dlog" 2>/dev/null || true)
+            attempts_all=$(grep -c -F -- "Sending replaceable event" "$dlog" 2>/dev/null || true)
+            attempts_linked=$(grep -c -E -- "Sending replaceable event.*${order}|${order}.*Sending replaceable event" "$dlog" 2>/dev/null || true)
+          else
+            fail_wp=absent; fail_total=absent; pubfail=absent; recwarn=absent; statusseen=absent; attempts_all=absent; attempts_linked=absent
+          fi
+          fail_wp=$(num "$fail_wp"); fail_total=$(num "$fail_total")
+          fail_other=$((fail_total-fail_wp)); [ "$fail_other" -ge 0 ] || fail_other=0
+          pubfail=$(num "$pubfail"); recwarn=$(num "$recwarn")
+          statusseen=$(num "$statusseen"); attempts_all=$(num "$attempts_all"); attempts_linked=$(num "$attempts_linked")
+          ambig=$((fail_other+pubfail+recwarn))
+          attempts_ok=false; [ "$attempts_linked" -gt 0 ] && attempts_ok=true
+          nod_complete=false
+          if [ "$nod_state" = ok ] && [ "$(num "$nod_count")" -lt 50 ]; then nod_complete=true; fi
+          dc=$(num "$d_count"); nd=$(num "$nod_dmatch")
+          cls=inconclusive_insufficient_evidence
+          if [ "$meta_state" = invalid ]; then cls=inconclusive_insufficient_evidence
+          elif [ "$d_has_wp" = true ]; then cls=retrieved
+          elif [ "$nod_state" = ok ] && [ "$nod_has_wp" = true ]; then cls=filter_index_suspect
+          elif [ "$meta_state" = ok ] && [ "$dc" -gt 0 ]; then
+            if [ "$fail_wp" -gt 0 ]; then cls=publish_rejected
+            elif [ "$ambig" -gt 0 ]; then cls=inconclusive_insufficient_evidence
+            elif [ "$nod_state" = ok ] && [ "$nod_complete" = true ] && [ "$nd" -gt 0 ]; then cls=ack_without_store_suspected
+            else cls=inconclusive_insufficient_evidence; fi
+          elif [ "$meta_state" = ok ]; then
+            if [ "$fail_wp" -gt 0 ]; then cls=publish_rejected
+            elif [ "$ambig" -gt 0 ]; then cls=inconclusive_insufficient_evidence
+            elif [ "$nod_state" = ok ] && [ "$nod_complete" = true ] && [ "$nd" -eq 0 ] && [ "$attempts_ok" = true ]; then cls=not_stored
+            else cls=inconclusive_insufficient_evidence; fi
+          elif [ "$nod_state" = ok ] && [ "$nod_complete" = true ] && [ "$nd" -eq 0 ]; then
+            if [ "$fail_wp" -gt 0 ]; then cls=publish_rejected
+            elif [ "$ambig" -gt 0 ]; then cls=inconclusive_insufficient_evidence
+            elif [ "$attempts_ok" = true ]; then cls=not_stored
+            else cls=inconclusive_insufficient_evidence; fi
+          fi
+          line="DIAG class=$cls order=$order d_meta=$meta_state d_count=$d_count d_s=[$d_s] d_at=[$d_at] nod_state=$nod_state nod_req_rc=$nod_rc nod_count=$nod_count nod_d_match=$nod_dmatch nod_complete=$nod_complete nod_s=[$nod_s] attempts=$attempts_linked attempts_all=$attempts_all attempts_ok=$attempts_ok wp_status_logs=$statusseen fail_wp=$fail_wp fail_other=$fail_other publish_failed=$pubfail reconciler_warns=$recwarn"
+          echo "$line"
+          printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
       - name: Verdict
         if: always()
         env:
