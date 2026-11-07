@@ -447,11 +447,14 @@ jobs:
           if [ "$FINAL" = SELECTED ]; then
             event_found=no
             for p in $(seq 1 15); do
-              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 --jq 'select(any(.tags[]; .[0]=="s" and .[1]=="waiting-payment"))' ws://localhost:8080 < /dev/null > "$E/order38383.waitingpayment.json" 2> "$E/order38383.waitingpayment.req.stderr"
+              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 ws://localhost:8080 < /dev/null > /tmp/raw38383.json 2> "$E/order38383.waitingpayment.req.stderr"
               orc=$?; echo "$orc" > "$E/order38383.waitingpayment.req.rc"
+              jq -c 'select(any(.tags[]; .[0]=="s" and .[1]=="waiting-payment"))' /tmp/raw38383.json > "$E/order38383.waitingpayment.json" 2>/dev/null || true
+              jq -sc '{count: length, events: [.[]? | {id: .id, created_at: .created_at, pubkey: .pubkey, kind: .kind, d: ([.tags[]? | select(.[0]=="d") | .[1]][0] // null), s: ([.tags[]? | select(.[0]=="s") | .[1]][0] // null)}]}' /tmp/raw38383.json > "$E/order38383.waitingpayment.meta.json" 2>/dev/null || true
               if [ "$orc" = 0 ] && grep -q '"kind":38383' "$E/order38383.waitingpayment.json"; then event_found=yes; break; fi
               sleep 20
             done
+            rm -f /tmp/raw38383.json
             if [ "$event_found" = yes ]; then
               nak verify < "$E/order38383.waitingpayment.json" > "$E/order38383.waitingpayment.verify.stdout" 2> "$E/order38383.waitingpayment.verify.stderr"
               echo $? > "$E/order38383.waitingpayment.verify.rc"
@@ -677,6 +680,7 @@ jobs:
           grep -q '^add_invoice_publish_rc=0$' "$RUNNER_TEMP/addinvoice.out"
           daemon_log=$(docker logs satonero-daemon 2>&1)
           grep -F -q "Order Id: $order updated Nostr new Status: waiting-payment" <<<"$daemon_log"
+          printf '%s\n' "$daemon_log" | grep -E "orderbook publish|Sending replaceable event|orderbook reconciler|Order Id: ${order} updated Nostr" > "$E/daemon_orderbook.log" || true
           for f in maker_neworder14.verify.rc maker_ack14.req.rc maker_ack14.verify.rc maker.decrypt.rc order38383.initial.req.rc order38383.initial.verify.rc taker_take_sell14.verify.rc taker_add_invoice14.req.rc taker_add_invoice14.verify.rc taker.decrypt.rc maker_waiting_buyer_invoice14.req.rc maker_waiting_buyer_invoice14.verify.rc maker.decrypt.rc order38383.updated.req.rc order38383.updated.verify.rc taker_add_invoice_request14.verify.rc maker_pay_invoice14.verify.rc taker_waiting_seller_to_pay14.verify.rc order38383.waitingpayment.req.rc order38383.waitingpayment.verify.rc; do
             test "$(cat "$E/$f")" = 0 || { echo "FAIL: $f"; exit 1; }
           done
@@ -812,7 +816,7 @@ jobs:
           PY
           if grep -q '^shape=preinvoice_handshake_ok$' "$RUNNER_TEMP/shape.txt" && grep -q '^shape=invoice_handshake_ok$' "$RUNNER_TEMP/invoice_shape.txt"; then r=pass; n=0; else r=fail; n=1; fi
           echo "check=plaintext_shape_gate result=$r count=$n" >> "$OUT"
-          bad=$(ls "$E" | { grep -v -E '^(manifest\.txt|maker_neworder14\.(json|verify\.(stdout|stderr|rc))|maker_neworder\.plain|maker_ack14\.(id|json|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_ack\.plain|maker\.decrypt\.(stderr|rc)|taker_take_sell14\.(json|verify\.(stdout|stderr|rc))|taker_take_sell\.plain|taker\.decrypt\.(stderr|rc)|order38383\.(initial|updated|waitingpayment)\.(json|req\.(rc|stderr)|verify\.(stdout|stderr|rc))|order_id\.txt|taker_add_invoice_request14\.(json|verify\.(stdout|stderr|rc))|taker_add_invoice_request\.plain|maker_pay_invoice14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_waiting_seller_to_pay14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_add_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_waiting_buyer_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc)))$' || true; } | wc -l)
+          bad=$(ls "$E" | { grep -v -E '^(manifest\.txt|maker_neworder14\.(json|verify\.(stdout|stderr|rc))|maker_neworder\.plain|maker_ack14\.(id|json|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_ack\.plain|maker\.decrypt\.(stderr|rc)|taker_take_sell14\.(json|verify\.(stdout|stderr|rc))|taker_take_sell\.plain|taker\.decrypt\.(stderr|rc)|order38383\.(initial|updated|waitingpayment)\.(json|meta\.json|req\.(rc|stderr)|verify\.(stdout|stderr|rc))|daemon_orderbook\.log|order_id\.txt|taker_add_invoice_request14\.(json|verify\.(stdout|stderr|rc))|taker_add_invoice_request\.plain|maker_pay_invoice14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_waiting_seller_to_pay14\.(id|json|plain|verify\.(stdout|stderr|rc))|taker_add_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc))|maker_waiting_buyer_invoice14\.(json|plain|req\.rc|req\.stderr|verify\.(stdout|stderr|rc)))$' || true; } | wc -l)
           [ "$bad" = 0 ] && r=pass || r=fail
           echo "check=unexpected_file_names result=$r count=$bad" >> "$OUT"
           cat "$OUT"
