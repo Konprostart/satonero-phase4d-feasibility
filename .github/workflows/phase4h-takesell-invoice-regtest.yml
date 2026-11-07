@@ -790,8 +790,54 @@ jobs:
           echo "check=client_key_exact_match result=$km count=$kn" >> "$OUT"
           if [ ! -s "$RUNNER_TEMP/daemon.nsec" ] || grep -R -F -q -f "$RUNNER_TEMP/daemon.nsec" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err"; then r=fail; n=1; else r=pass; n=0; fi
           echo "check=daemon_nsec_exact_match result=$r count=$n" >> "$OUT"
-          pat='nsec1|ncryptsec|BEGIN [A-Z ]*PRIVATE|macaroon|daemon\.nsec|maker\.hex|taker\.hex|NOSTR_SECRET_KEY|AgE[A-Za-z0-9+/]{40,}'
-          n=$({ grep -R -E -i -l -- "$pat" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" || true; } | wc -l); [ "$n" = 0 ] && r=pass || r=fail
+          pat='nsec1|ncryptsec|BEGIN [A-Z ]*PRIVATE|macaroon|daemon\.nsec|maker\.hex|taker\.hex|NOSTR_SECRET_KEY'
+          n=$({ grep -R -E -i -l -- "$pat" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" || true; } | wc -l)
+          n_age=$(python3 - "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" <<'PY'
+          import json, os, re, sys
+          E=sys.argv[1]; outs=sys.argv[2:]
+          age=re.compile(r'AgE[A-Za-z0-9+/]{40,}', re.I)
+          b64=re.compile(r'[A-Za-z0-9+/]+={0,2}')
+          violations=0
+          def scan(text):
+              return 1 if age.search(text) else 0
+          def read(path):
+              try:
+                  return open(path,encoding='utf-8',errors='replace').read()
+              except OSError:
+                  raise SystemExit(2)
+          hex64=re.compile(r'[0-9a-f]{64}')
+          hex128=re.compile(r'[0-9a-f]{128}')
+          for dirpath, dirnames, filenames in os.walk(E, followlinks=True):
+              for name in sorted(filenames):
+                  p=os.path.join(dirpath,name)
+                  if not os.path.isfile(p): continue
+                  text=read(p)
+                  if name.endswith('.json'):
+                      try:
+                          ev=json.loads(text)
+                      except Exception:
+                          raise SystemExit(2)
+                      if isinstance(ev,dict) and ev.get('kind')==14:
+                          content=ev.get('content')
+                          if (not isinstance(content,str) or not content.startswith('Ag')
+                              or not b64.fullmatch(content)
+                              or not isinstance(ev.get('id'),str) or not hex64.fullmatch(ev['id'])
+                              or not isinstance(ev.get('pubkey'),str) or not hex64.fullmatch(ev['pubkey'])
+                              or not isinstance(ev.get('sig'),str) or not hex128.fullmatch(ev['sig'])):
+                              raise SystemExit(2)
+                          stripped=dict(ev); stripped.pop('content',None)
+                          violations += scan(json.dumps(stripped,sort_keys=True))
+                          continue
+                  violations += scan(text)
+          for p in outs:
+              if not os.path.isfile(p):
+                  raise SystemExit(2)
+              violations += scan(read(p))
+          print(violations)
+          PY
+          ) || n_age=1
+          case "$n_age" in ''|*[!0-9]*) n_age=1 ;; esac
+          n=$((n + n_age)); [ "$n" = 0 ] && r=pass || r=fail
           echo "check=secret_pattern_files result=$r count=$n" >> "$OUT"
           PY_RC=0
           python3 - "$E" "$OUT" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/taker.pub" <<'PY' || PY_RC=$?
