@@ -713,17 +713,24 @@ jobs:
           d=/tmp/stagea_dm; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
           check() {
             recipient="$1"; keyfile="$2"; action="$3"
-            ids=$(timeout 40 nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null | sort -u)
             n=0
-            for id in $ids; do
-              timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > "$d/$id.json" 2>/dev/null || continue
-              nak verify < "$d/$id.json" >/dev/null 2>&1 || continue
-              ct=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null) || continue
-              export NOSTR_SECRET_KEY="$(cat "$keyfile")"
-              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null > "$d/$id.plain" 2>/dev/null || { unset NOSTR_SECRET_KEY; continue; }
-              unset NOSTR_SECRET_KEY
-              jq -e --arg a "$action" --arg o "$ORDER" '.[0].order.action==$a and .[0].order.id==$o and .[0].order.status=="active"' "$d/$id.plain" >/dev/null 2>&1 || continue
-              n=$((n+1))
+            attempt=0
+            while [ "$attempt" -lt 30 ]; do
+              attempt=$((attempt+1))
+              ids=$(timeout 40 nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null | sort -u)
+              n=0
+              for id in $ids; do
+                timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > "$d/$id.json" 2>/dev/null || continue
+                nak verify < "$d/$id.json" >/dev/null 2>&1 || continue
+                ct=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null) || continue
+                export NOSTR_SECRET_KEY="$(cat "$keyfile")"
+                timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null > "$d/$id.plain" 2>/dev/null || { unset NOSTR_SECRET_KEY; continue; }
+                unset NOSTR_SECRET_KEY
+                jq -e --arg a "$action" --arg o "$ORDER" '.[0].order.action==$a and .[0].order.id==$o and .[0].order.status=="active"' "$d/$id.plain" >/dev/null 2>&1 || continue
+                n=$((n+1))
+              done
+              [ "$n" -ge 1 ] && break
+              [ "$attempt" -lt 30 ] && sleep 2
             done
             printf '%s=%s\n' "$action" "$n"
             [ "$n" = 1 ]
@@ -734,8 +741,17 @@ jobs:
           cid=$(docker compose ps -q nostr_relay); test -n "$cid"
           docker cp "$RUNNER_TEMP/stagea_dm.sh" "$cid:/tmp/stagea_dm.sh"
           docker exec "$cid" sh -c 'rm -rf /tmp/stagea_dm'
-          docker compose exec -T nostr_relay sh /tmp/stagea_dm.sh "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err"
+          dm_rc=0
+          timeout 60 docker compose exec -T nostr_relay sh /tmp/stagea_dm.sh "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err" || dm_rc=$?
           cat "$RUNNER_TEMP/stagea_dm.out"
+          if [ "$dm_rc" -ne 0 ]; then
+            echo "DM helper failed rc=$dm_rc" >&2
+            if [ -f "$RUNNER_TEMP/stagea_dm.err" ]; then
+              stderr_bytes=$(wc -c < "$RUNNER_TEMP/stagea_dm.err" 2>/dev/null || echo unavailable)
+              echo "DM helper stderr bytes=$stderr_bytes" >&2
+            fi
+            exit "$dm_rc"
+          fi
           ln_mostro cancelinvoice "$HOLD_HASH" >/dev/null 2>&1 || true
           cancel_state=missing
           for i in $(seq 1 60); do
