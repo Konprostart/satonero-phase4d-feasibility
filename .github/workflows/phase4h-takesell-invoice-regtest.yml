@@ -791,37 +791,64 @@ jobs:
           if [ ! -s "$RUNNER_TEMP/daemon.nsec" ] || grep -R -F -q -f "$RUNNER_TEMP/daemon.nsec" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err"; then r=fail; n=1; else r=pass; n=0; fi
           echo "check=daemon_nsec_exact_match result=$r count=$n" >> "$OUT"
           pat='nsec1|ncryptsec|BEGIN [A-Z ]*PRIVATE|macaroon|daemon\.nsec|maker\.hex|taker\.hex|NOSTR_SECRET_KEY'
-          n=$({ grep -R -E -i -l -- "$pat" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" || true; } | wc -l)
-          n_age=$(python3 - "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" <<'PY'
+          raw_hits=$({ grep -R -E -i -l -- "$pat" "$E" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" || true; })
+          n=$(printf '%s\n' "$raw_hits" | grep -c . || true)
+          printf '%s\n' "$raw_hits" | while IFS= read -r hit; do
+            [ -n "$hit" ] || continue
+            case "$hit" in
+              "$E"/*) rel="evidence/${hit#"$E"/}" ;;
+              *) rel="${hit##*/}" ;;
+            esac
+            echo "secret_pattern_files diag: category=raw file=$rel" >> "$OUT"
+          done
+          n_age=$(python3 - "$E" "$OUT" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" <<'PY'
           import json, os, re, sys
-          E=sys.argv[1]; outs=sys.argv[2:]
+          E=sys.argv[1]; OUT=sys.argv[2]; outs=sys.argv[3:]
           age=re.compile(r'AgE[A-Za-z0-9+/]{40,}', re.I)
           b64=re.compile(r'[A-Za-z0-9+/]+={0,2}')
           violations=0
           def scan(text):
               return 1 if age.search(text) else 0
+          def relpath(p):
+              p=os.path.normpath(p); root=os.path.normpath(E)
+              if p==root: return 'evidence'
+              if p.startswith(root+os.sep): return 'evidence/'+os.path.relpath(p,root)
+              return os.path.basename(p)
+          def diag(category,name=None):
+              line=f"secret_pattern_files diag: category={category}"
+              if name is not None: line+=f" file={relpath(name)}"
+              with open(OUT,'a',encoding='utf-8') as f: f.write(line+'\n')
           def read(path):
               try:
                   return open(path,encoding='utf-8',errors='replace').read()
               except OSError:
-                  raise SystemExit(2)
+                  diag('fail_closed_unreadable',path); raise SystemExit(2)
           hex64=re.compile(r'[0-9a-f]{64}')
           hex128=re.compile(r'[0-9a-f]{128}')
           bolt11=re.compile(r'^lnbcrt([1-9][0-9]*[munp])?1[02-9ac-hj-np-z]{50,2000}$')
-          shape=read(os.path.join(os.path.dirname(E),'invoice_shape.txt'))
+          shape_path=os.path.join(os.path.dirname(E),'invoice_shape.txt')
+          if not os.path.isfile(shape_path):
+              diag('fail_closed_missing_witness',shape_path); raise SystemExit(2)
+          shape=read(shape_path)
           if 'shape=invoice_handshake_ok' not in shape.splitlines():
-              raise SystemExit(2)
+              diag('fail_closed_invalid_witness',shape_path); raise SystemExit(2)
           invoices=set()
           for invname in ('taker_add_invoice_request.plain','maker_pay_invoice14.plain'):
+              ip=os.path.join(E,invname)
+              if not os.path.isfile(ip):
+                  diag('fail_closed_missing_invoice_file',ip); raise SystemExit(2)
               try:
-                  msg=json.loads(read(os.path.join(E,invname)))
-                  pr=msg[0]['order']['payload']['payment_request']
+                  msg=json.loads(read(ip))
               except SystemExit:
                   raise
               except Exception:
-                  raise SystemExit(2)
+                  diag('fail_closed_malformed_invoice_json',ip); raise SystemExit(2)
+              try:
+                  pr=msg[0]['order']['payload']['payment_request']
+              except Exception:
+                  diag('fail_closed_invalid_invoice_structure',ip); raise SystemExit(2)
               if not isinstance(pr,list) or len(pr)!=3 or not isinstance(pr[1],str) or not bolt11.fullmatch(pr[1]):
-                  raise SystemExit(2)
+                  diag('fail_closed_invalid_invoice',ip); raise SystemExit(2)
               invoices.add(pr[1])
           for dirpath, dirnames, filenames in os.walk(E, followlinks=True):
               for name in sorted(filenames):
@@ -832,7 +859,7 @@ jobs:
                       try:
                           ev=json.loads(text)
                       except Exception:
-                          raise SystemExit(2)
+                          diag('fail_closed_malformed_json',p); raise SystemExit(2)
                       if isinstance(ev,dict) and ev.get('kind')==14:
                           content=ev.get('content')
                           if (not isinstance(content,str) or not content.startswith('Ag')
@@ -840,20 +867,24 @@ jobs:
                               or not isinstance(ev.get('id'),str) or not hex64.fullmatch(ev['id'])
                               or not isinstance(ev.get('pubkey'),str) or not hex64.fullmatch(ev['pubkey'])
                               or not isinstance(ev.get('sig'),str) or not hex128.fullmatch(ev['sig'])):
-                              raise SystemExit(2)
+                              diag('fail_closed_invalid_kind14',p); raise SystemExit(2)
                           stripped=dict(ev); stripped.pop('content',None)
-                          violations += scan(json.dumps(stripped,sort_keys=True))
+                          if scan(json.dumps(stripped,sort_keys=True)):
+                              diag('age',p); violations += 1
                           continue
                   scan_text=text
                   if dirpath==E and name in ('taker_add_invoice_request.plain','maker_pay_invoice14.plain'):
                       for inv in invoices:
                           if inv in scan_text:
                               scan_text=scan_text.replace(inv,'')
-                  violations += scan(scan_text)
+                  if scan(scan_text):
+                      diag('age',p); violations += 1
           for p in outs:
               if not os.path.isfile(p):
-                  raise SystemExit(2)
-              violations += scan(read(p))
+                  diag('fail_closed_missing_out',p); raise SystemExit(2)
+              t=read(p)
+              if scan(t):
+                  diag('age',p); violations += 1
           print(violations)
           PY
           ) || n_age=1
