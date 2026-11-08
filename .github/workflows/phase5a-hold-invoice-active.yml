@@ -723,9 +723,26 @@ jobs:
               [ "$rem" -gt 0 ] || break
               n=0
               qfile="$d/$action.ids"
-              timeout "$rem" nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null > "$qfile" 2>/dev/null
+              qerr="$d/$action.err"
+              timeout "$rem" nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null > "$qfile" 2> "$qerr"
               qrc=$?
-              if [ "$qrc" -ne 0 ]; then incomplete=1; break; fi
+              if [ "$qrc" -ne 0 ]; then
+                incomplete=1
+                qerr_line=$(head -n 1 "$qerr" 2>/dev/null | cut -c1-256)
+                case "$qrc" in
+                  124) qlabel=query_timeout ;;
+                  *) case "$qerr_line" in
+                       *[Cc]onnect*|*[Nn]o*route*|*[Uu]nable*to*|*[Rr]efused*) qlabel=relay_connection ;;
+                       *[Tt]imeout*|*timed*out*) qlabel=query_timeout ;;
+                       *[Uu]sage*|*[Ii]nvalid*|*[Uu]nknown*) qlabel=cli_error ;;
+                       "") qlabel=empty_stderr ;;
+                       *) qlabel=other ;;
+                     esac ;;
+                esac
+                printf 'query_rc=%s\n' "$qrc"
+                printf 'query_error=%s\n' "$qlabel"
+                break
+              fi
               ids=$(sort -u "$qfile")
               for id in $ids; do
                 rem=$((deadline - $(date +%s)))
