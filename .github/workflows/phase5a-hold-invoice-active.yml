@@ -1,0 +1,927 @@
+name: phase5a-hold-invoice-active
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: phase5a-hold-invoice-active
+  cancel-in-progress: false
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Pre-flight and disk gate
+        run: |
+          set -euo pipefail
+          df -h /
+          docker --version
+          docker compose version
+          jq --version
+          git --version
+      - name: Free preinstalled space
+        run: |
+          set -euo pipefail
+          for p in /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/share/swift; do
+            if [ -e "$p" ]; then sudo rm -rf "$p"; fi
+          done
+          free_kb=$(df --output=avail -k / | tail -1)
+          test "$free_kb" -ge 8388608 || { echo "INFEASIBLE-DISK: < 8 GB free"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: Konprostart/Satonero
+          ref: 2534f8b0f05ade36007445511e02747f4468109a
+          path: satonero
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: MostroP2P/mostro-regtest
+          ref: c6adbdaaaf0a2152a0728dbce6adf11945f547bd
+          path: mostro-regtest
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify pinned SHAs and clean Satonero tree
+        run: |
+          set -euo pipefail
+          test "$(git -C satonero rev-parse HEAD)" = "2534f8b0f05ade36007445511e02747f4468109a"
+          test "$(git -C mostro-regtest rev-parse HEAD)" = "c6adbdaaaf0a2152a0728dbce6adf11945f547bd"
+          test -z "$(git -C satonero status --porcelain --untracked-files=all)"
+      - name: Pin nak and apply runner-only relay healthcheck fix
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          f=docker/nostr_relay/Dockerfile
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "16c3d80abc0ec58a72b782dc78f5eab2021c3fdab386514672777d941d34f553"
+          python3 - <<'PY'
+          p = "docker/nostr_relay/Dockerfile"
+          lines = open(p, encoding="utf-8").read().split("\n")
+          old, new = "apt-get install -y curl gosu", "apt-get install -y curl gosu jq"
+          hits = [n for n, line in enumerate(lines) if old in line]
+          assert len(hits) == 1, hits
+          lines[hits[0]] = lines[hits[0]].replace(old, new)
+          i = [n for n, line in enumerate(lines) if line.startswith("RUN BIN_URL=$(curl -s https://api.github.com/repos/fiatjaf/nak/releases/latest")]
+          assert len(i) == 1, i
+          i = i[0]
+          slash = chr(92)
+          assert lines[i].endswith("grep linux-amd64) " + slash), lines[i]
+          lines[i] = "RUN BIN_URL=https://github.com/fiatjaf/nak/releases/download/v0.22.2/nak-v0.22.2-linux-amd64 " + slash
+          j = [n for n, line in enumerate(lines) if line == "  && curl -SLO $BIN_URL " + slash]
+          assert len(j) == 1, j
+          lines[j[0]:j[0] + 1] = [
+              "  && curl -fSLO $BIN_URL " + slash,
+              '  && echo "1b81a772619d913f345ecc3d663edcd37e7548ea6b4e21c582bb3826e2604556  nak-v0.22.2-linux-amd64" | sha256sum -c - ' + slash,
+          ]
+          open(p, "w", encoding="utf-8").write("\n".join(lines))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "ab32f22df3de0185ac04d75b5269d532127557abcad3f89180a63e9032402cb3"
+          f=docker-compose.yml
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "ac08e210765c0c95cd255be2045127f595b3da8d66a27288a4b254ff8b71ea4d"
+          python3 - <<'PY'
+          p = "docker-compose.yml"
+          text = open(p, encoding="utf-8").read()
+          old, new = "nak relay nostr_relay:8080", "nak relay http://nostr_relay:8080"
+          assert text.count(old) == 1
+          open(p, "w", encoding="utf-8").write(text.replace(old, new))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "65a3d14cc76245ec6dca5b1b939e934cbd509fe8788c1935d940def9be606b0c"
+      - name: Pin geth-hdwallet in bitcoin image
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          f=docker/bitcoin/Dockerfile
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "f093ea3eaab491e62e8f4b87ffff8d066f0a980d7b3424277f377da87324cc45"
+          python3 - <<'PY'
+          p = "docker/bitcoin/Dockerfile"
+          lines = open(p, encoding="utf-8").read().split("\n")
+          slash = chr(92)
+          i = [n for n, line in enumerate(lines) if line.startswith("RUN BIN_URL=$(curl -s https://api.github.com/repos/miguelmota/go-ethereum-hdwallet/releases/")]
+          assert len(i) == 1, i
+          i = i[0]
+          assert lines[i + 1] == "  && TMP_DIR=$(mktemp -d) " + slash, lines[i + 1]
+          assert lines[i + 2] == "  && cd $TMP_DIR " + slash, lines[i + 2]
+          assert lines[i + 3] == "  && curl -SLO $BIN_URL " + slash, lines[i + 3]
+          assert lines[i + 4] == "  && tar -xzf ${BIN_URL##*/} " + slash, lines[i + 4]
+          lines[i] = "RUN BIN_URL=https://api.github.com/repos/miguelmota/go-ethereum-hdwallet/releases/assets/249927833 " + slash
+          lines[i + 3] = '  && curl -fSL --retry 3 --retry-max-time 60 -H "Accept: application/octet-stream" -o geth-hdwallet.tar.gz "$BIN_URL" ' + slash
+          lines[i + 4] = "  && tar -xzf geth-hdwallet.tar.gz " + slash
+          lines.insert(i + 4, '  && echo "a53a72d29ac0d57c36a2ab46010a6a52c6fa1bcf21345abc649f1a2161302d48  geth-hdwallet.tar.gz" | sha256sum -c - ' + slash)
+          open(p, "w", encoding="utf-8").write("\n".join(lines))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "9fb761ea6f2b3d6c5cacf31fec49bae2c9f9a5dfe50c1131ddf3975cbd7b2a05"
+      - name: Build Satonero daemon image
+        working-directory: satonero
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          docker compose -f docker/compose.yml build mostro
+          free_kb=$(df --output=avail -k / | tail -1)
+          test "$free_kb" -ge 3145728 || { echo "INFEASIBLE-DISK: < 3 GB free"; exit 1; }
+      - name: Start disposable regtest services and wait for health
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          docker compose up -d bitcoin mostro_lnd alice_lnd bob_lnd nostr_relay
+          for i in $(seq 1 60); do
+            out=$(docker compose ps --format '{{.Service}} {{.Health}}' bitcoin mostro_lnd alice_lnd bob_lnd nostr_relay)
+            echo "$out"
+            [ "$(printf '%s\n' "$out" | grep -c ' healthy$')" -eq 5 ] && exit 0
+            sleep 10
+          done
+          echo "FAIL: regtest healthchecks not all healthy"; exit 1
+      - name: Verify jq is available in the relay container
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          docker compose exec -T nostr_relay jq --version
+      - name: Generate disposable daemon key and assert pre-invoice settings
+        working-directory: satonero
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
+          nsec=$(printf '%s\n' "$hex" | docker run --rm -i --entrypoint nak mostro-regtest-nostr_relay encode nsec)
+          pub=$(printf '%s\n' "$hex" | docker run --rm -i --entrypoint nak mostro-regtest-nostr_relay key public)
+          printf '%s' "$nsec" > "$RUNNER_TEMP/daemon.nsec"
+          printf '%s' "$pub" > "$RUNNER_TEMP/daemon.pub"
+          unset hex nsec
+          python3 - <<'PY'
+          import os, tomllib
+          rt = os.environ["RUNNER_TEMP"]
+          src = open("settings.tpl.toml", encoding="utf-8").read()
+          daemon_nsec = open(os.path.join(rt, "daemon.nsec"), encoding="utf-8").read().strip()
+          replacements = [
+              ("lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'", "lnd_cert_file = '/config/lnd/tls.cert'"),
+              ("lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'", "lnd_macaroon_file = '/config/lnd/admin.macaroon'"),
+              ("lnd_grpc_host = 'https://127.0.0.1:10001'", "lnd_grpc_host = 'https://mostro_lnd:10001'"),
+              ("nsec_privkey = 'nsec1...'", "nsec_privkey = '" + daemon_nsec + "'"),
+              ("relays = ['ws://localhost:7000']", "relays = ['ws://nostr_relay:8080']"),
+              ('bitcoin_price_api_url = "https://api.yadio.io"', 'bitcoin_price_api_url = "http://127.0.0.1:9"'),
+          ]
+          for old, new in replacements:
+              assert src.count(old) == 1, old
+              src = src.replace(old, new)
+          cfg = tomllib.loads(src)
+          assert cfg["mostro"]["dev_fee_enabled"] is False
+          assert cfg["mostro"]["pow"] == 0
+          assert cfg.get("anti_abuse_bond") is None or cfg["anti_abuse_bond"].get("enabled") is not True
+          assert cfg.get("cashu") is None or cfg["cashu"].get("enabled") is not True
+          assert cfg["nostr"]["relays"] == ["ws://nostr_relay:8080"]
+          open(os.path.join(rt, "settings.toml"), "w", encoding="utf-8").write(src)
+          print("settings parsed; bonds/Cashu/dev-fee payments disabled")
+          PY
+          echo "daemon pubkey: $pub"
+      - name: Install settings and start daemon
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm --entrypoint id docker-mostro -u)
+          docker volume create satonero-config >/dev/null
+          docker run --rm --user root --entrypoint sh -v satonero-config:/config -v mostro-regtest_mostro_lnd:/lnd:ro -v "$RUNNER_TEMP":/src:ro docker-mostro -c "set -e; mkdir -p /config/lnd; cp /src/settings.toml /config/settings.toml; cp /lnd/tls.cert /config/lnd/tls.cert; cp /lnd/data/chain/bitcoin/regtest/admin.macaroon /config/lnd/admin.macaroon; chmod 600 /config/settings.toml /config/lnd/admin.macaroon; chown -R $uid:$uid /config"
+          docker network inspect mostro-regtest_default >/dev/null
+          docker run -d --name satonero-daemon --network mostro-regtest_default -v satonero-config:/config docker-mostro:latest >/dev/null
+          sleep 60
+          test "$(docker inspect -f '{{.State.Running}}' satonero-daemon)" = true
+      - name: Verify LND, mine regtest blocks, sync and maintenance off
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          lnd_id=$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 getinfo | jq -r .identity_pubkey)
+          daemon_id=""
+          for i in $(seq 1 30); do
+            daemon_id=$(docker logs satonero-daemon 2>&1 | grep -a "Recorded Lightning node identity" | grep -oE '[0-9a-f]{66}' | tail -1 || true)
+            [ -n "$daemon_id" ] && break
+            sleep 10
+          done
+          test -n "$daemon_id" && test "$daemon_id" = "$lnd_id"
+          if docker logs satonero-daemon 2>&1 | grep -a -E "No connection to LND|panic|REFUSING TO START"; then echo "FAIL: daemon startup/LND error"; exit 1; fi
+          bc() { docker compose exec -T --user bitcoin bitcoin bitcoin-cli -regtest -rpcport=18443 -rpcuser=bitcoin -rpcpassword=bitcoin "$@"; }
+          bc createwallet dev >/dev/null 2>&1 || bc loadwallet dev >/dev/null 2>&1 || true
+          addr=$(bc -rpcwallet=dev getnewaddress)
+          bc -rpcwallet=dev generatetoaddress 150 "$addr" >/dev/null
+          synced=no
+          for i in $(seq 1 60); do
+            [ "$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 getinfo | jq -r .synced_to_chain)" = true ] && { synced=yes; break; }
+            sleep 10
+          done
+          test "$synced" = yes
+          channel_count=$(docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 listchannels | jq '.channels | length')
+          test "$channel_count" = 0 || { echo "FAIL: unexpected regtest channel count=$channel_count"; exit 1; }
+          sleep 330
+          test "$(docker logs satonero-daemon 2>&1 | grep -a -c 'maintenance mode ON' || true)" = 0
+          last_info=$(docker logs satonero-daemon 2>&1 | grep -a "Sending info about mostro" | tail -1 || true)
+          if printf '%s' "$last_info" | grep -q maintenance; then echo "FAIL: maintenance advertised"; exit 1; fi
+          echo "LND identity/sync and maintenance-off gates passed"
+      - name: Generate separate disposable maker and taker keys
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          for role in maker taker; do
+            hex=$(docker run --rm --entrypoint nak mostro-regtest-nostr_relay key generate)
+            pub=$(printf '%s\n' "$hex" | docker run --rm -i --entrypoint nak mostro-regtest-nostr_relay key public)
+            printf '%s' "$hex" > "$RUNNER_TEMP/$role.hex"
+            printf '%s' "$pub" > "$RUNNER_TEMP/$role.pub"
+            chmod 600 "$RUNNER_TEMP/$role.hex"
+            echo "$role trade pubkey: $pub"
+            unset hex
+          done
+          test "$(cat "$RUNNER_TEMP/maker.pub")" != "$(cat "$RUNNER_TEMP/taker.pub")"
+      - name: Create one taker regtest payout invoice
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          req=$(docker compose exec -T --user lnd bob_lnd lncli --network=regtest --rpcserver=localhost:10001 addinvoice --amt 1000 --expiry 86400 | jq -r .payment_request)
+          case "$req" in lnbcrt1*) ;; *) echo "FAIL: payout invoice is not regtest"; exit 1;; esac
+          printf '%s\n' "$req" | grep -Eq '^lnbcrt([1-9][0-9]*[munp])?1[02-9ac-hj-np-z]{50,2000}$' || { echo "FAIL: malformed payout invoice"; exit 1; }
+          printf '%s' "$req" > "$RUNNER_TEMP/taker_invoice.txt"
+          chmod 600 "$RUNNER_TEMP/taker_invoice.txt"
+          unset req
+          echo "taker payout invoice created (bolt11 withheld from logs)"
+      - name: Write Phase 4H scripts (no keys in script files)
+        run: |
+          set +x
+          umask 077
+          cat > "$RUNNER_TEMP/maker.sh" <<'SH'
+          #!/bin/sh
+          set -u
+          umask 077
+          DAEMON="$1"; MAKER="$2"; E=/tmp/evidence
+          mkdir -p "$E"; chmod 700 "$E"
+          TSEND=$(date +%s); TSTART=$((TSEND - 10))
+          MSG='[{"order":{"version":2,"request_id":101,"action":"new-order","payload":{"order":{"kind":"sell","fiat_code":"USD","fiat_amount":10,"amount":1000,"payment_method":"BANK_TRANSFER","premium":0}}}},null,null]'
+          printf '%s\n' "$MSG" > "$E/maker_neworder.plain"
+          export NOSTR_SECRET_KEY="$(cat /tmp/maker.hex)"
+          CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
+          echo "encrypt_rc=$? ciphertext_chars=${#CT}"
+          nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null > /tmp/maker.pub.out 2> /tmp/maker.pub.err
+          echo "new_order_publish_rc=$?"
+          echo "new_order_publish_stderr=$(tr '\n' ' ' < /tmp/maker.pub.err | cut -c1-200)"
+          cp /tmp/maker.pub.out "$E/maker_neworder14.json"
+          nak verify < "$E/maker_neworder14.json" > "$E/maker_neworder14.verify.stdout" 2> "$E/maker_neworder14.verify.stderr"
+          echo $? > "$E/maker_neworder14.verify.rc"
+          EXPR="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$MAKER\"]]) and .created_at>=$TSTART) | .id"
+          : > /tmp/maker.seen
+          i=0; FINAL=WINDOW
+          while [ $i -lt 15 ]; do
+            i=$((i+1))
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$MAKER" --limit 50 --jq "$EXPR" --jq-raw ws://localhost:8080 < /dev/null > /tmp/maker.cand 2> /tmp/maker.cand.err
+            rc=$?; echo "maker_ack_poll=$i rc=$rc"
+            if [ "$rc" != 0 ] || grep -Evq '^[0-9a-f]{64}$' /tmp/maker.cand; then FINAL=QUERY_FAILED; break; fi
+            cat /tmp/maker.cand >> /tmp/maker.seen
+            n=$(sort -u /tmp/maker.seen | grep -c . || true)
+            if [ "$n" -gt 1 ]; then FINAL=AMBIGUOUS_ACK; break; fi
+            sleep 20
+          done
+          n=$(sort -u /tmp/maker.seen | grep -c . || true)
+          [ "$FINAL" != WINDOW ] || { [ "$n" = 1 ] && FINAL=SELECTED || FINAL=MISSING_ACK; }
+          echo "maker_ack_candidates=$n maker_ack_final=$FINAL"
+          if [ "$FINAL" = SELECTED ]; then
+            ACKID=$(sort -u /tmp/maker.seen | grep . | head -1)
+            printf '%s\n' "$ACKID" > "$E/maker_ack14.id"
+            timeout 40 nak req --id "$ACKID" --limit 1 ws://localhost:8080 < /dev/null > "$E/maker_ack14.json" 2> "$E/maker_ack14.req.stderr"
+            echo $? > "$E/maker_ack14.req.rc"
+            nak verify < "$E/maker_ack14.json" > "$E/maker_ack14.verify.stdout" 2> "$E/maker_ack14.verify.stderr"
+            echo $? > "$E/maker_ack14.verify.rc"
+            CT2=$(timeout 40 nak req --id "$ACKID" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2> /tmp/maker.content.err)
+            nak decrypt --sender-pubkey "$DAEMON" "$CT2" < /dev/null > "$E/maker_ack.plain" 2> "$E/maker.decrypt.stderr"
+            echo $? > "$E/maker.decrypt.rc"
+            ORDER=$(grep -oE '"id":"[0-9a-f-]{36}"' "$E/maker_ack.plain" | head -1 | cut -d'"' -f4)
+            printf '%s\n' "$ORDER" > "$E/order_id.txt"
+            echo "ORDER_ID=$ORDER"
+            ORDER_EXPR="select(.kind==38383 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"d\")]==[[\"d\",\"$ORDER\"]]) and ([.tags[]|select(.[0]==\"s\")]==[[\"s\",\"pending\"]]))"
+            : > /tmp/order.initial.json
+            for j in $(seq 1 15); do
+              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 --jq "$ORDER_EXPR" ws://localhost:8080 < /dev/null > /tmp/order.initial.json 2> "$E/order38383.initial.req.stderr"
+              ORC=$?; echo "$ORC" > "$E/order38383.initial.req.rc"
+              if [ "$ORC" != 0 ]; then FINAL=QUERY_FAILED; break; fi
+              [ -s /tmp/order.initial.json ] && break
+              sleep 20
+            done
+            cp /tmp/order.initial.json "$E/order38383.initial.json"
+            if [ -s "$E/order38383.initial.json" ]; then
+              nak verify < "$E/order38383.initial.json" > "$E/order38383.initial.verify.stdout" 2> "$E/order38383.initial.verify.stderr"
+              echo $? > "$E/order38383.initial.verify.rc"
+            elif [ "$FINAL" = SELECTED ]; then
+              FINAL=INCONCLUSIVE_INITIAL_ORDER_EVENT
+            fi
+          fi
+          unset NOSTR_SECRET_KEY CT CT2 MSG
+          echo "FINAL=$FINAL"
+          SH
+          cat > "$RUNNER_TEMP/taker.sh" <<'SH'
+          #!/bin/sh
+          # Stop after the AddInvoice prompt; never submit an invoice.
+          set -u
+          umask 077
+          DAEMON="$1"; MAKER="$2"; TAKER="$3"; ORDER="$4"; E=/tmp/evidence
+          case "$ORDER" in ????????-????-????-????-????????????) ;; *) echo "FINAL=BAD_ORDER_ID"; exit 1;; esac
+          TSEND=$(date +%s); TSTART=$((TSEND - 10))
+          MSG=$(printf '[{"order":{"version":2,"request_id":202,"id":"%s","action":"take-sell","payload":null}},null,null]' "$ORDER")
+          printf '%s\n' "$MSG" > "$E/taker_take_sell.plain"
+          export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+          CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
+          nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null > /tmp/taker.pub.out 2> /tmp/taker.pub.err
+          echo "take_sell_publish_rc=$?"
+          echo "take_sell_publish_stderr=$(tr '\n' ' ' < /tmp/taker.pub.err | cut -c1-200)"
+          cp /tmp/taker.pub.out "$E/taker_take_sell14.json"
+          nak verify < "$E/taker_take_sell14.json" > "$E/taker_take_sell14.verify.stdout" 2> "$E/taker_take_sell14.verify.stderr"
+          echo $? > "$E/taker_take_sell14.verify.rc"
+          unset NOSTR_SECRET_KEY CT MSG
+          : > /tmp/taker.seen; : > /tmp/maker.seen
+          i=0; TAKER_ID=""; MAKER_ID=""; FINAL=WINDOW
+          EXPR_T="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$TAKER\"]]) and .created_at>=$TSTART) | .id"
+          EXPR_M="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$MAKER\"]]) and .created_at>=$TSTART and .id!=\"$(cat "$E/maker_ack14.id" 2>/dev/null || true)\") | .id"
+          while [ $i -lt 15 ]; do
+            i=$((i+1))
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$TAKER" --limit 50 --jq "$EXPR_T" --jq-raw ws://localhost:8080 < /dev/null > /tmp/taker.cand 2> /tmp/taker.cand.err; trc=$?
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$MAKER" --limit 50 --jq "$EXPR_M" --jq-raw ws://localhost:8080 < /dev/null > /tmp/maker.cand 2> /tmp/maker.cand.err; mrc=$?
+            echo "reply_poll=$i taker_rc=$trc maker_rc=$mrc"
+            [ "$trc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/taker.cand || { FINAL=QUERY_FAILED; break; }
+            [ "$mrc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/maker.cand || { FINAL=QUERY_FAILED; break; }
+            cat /tmp/taker.cand >> /tmp/taker.seen; cat /tmp/maker.cand >> /tmp/maker.seen
+            nt=$(sort -u /tmp/taker.seen | grep -c . || true); nm=$(sort -u /tmp/maker.seen | grep -c . || true)
+            [ "$nt" -le 1 ] && [ "$nm" -le 1 ] || { FINAL=AMBIGUOUS_REPLY; break; }
+            [ "$nt" = 1 ] && TAKER_ID=$(sort -u /tmp/taker.seen | grep . | head -1)
+            [ "$nm" = 1 ] && MAKER_ID=$(sort -u /tmp/maker.seen | grep . | head -1)
+            sleep 20
+          done
+          if [ "$FINAL" = WINDOW ]; then
+            if [ -n "$TAKER_ID" ] && [ -n "$MAKER_ID" ]; then FINAL=SELECTED; else FINAL=MISSING_REPLY; fi
+          fi
+          if [ "$FINAL" = SELECTED ]; then
+            timeout 40 nak req --id "$TAKER_ID" --limit 1 ws://localhost:8080 < /dev/null > "$E/taker_add_invoice14.json" 2> "$E/taker_add_invoice14.req.stderr"
+            echo $? > "$E/taker_add_invoice14.req.rc"
+            nak verify < "$E/taker_add_invoice14.json" > "$E/taker_add_invoice14.verify.stdout" 2> "$E/taker_add_invoice14.verify.stderr"
+            echo $? > "$E/taker_add_invoice14.verify.rc"
+            CT=$(timeout 40 nak req --id "$TAKER_ID" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2> /tmp/taker.content.err)
+            export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+            nak decrypt --sender-pubkey "$DAEMON" "$CT" < /dev/null > "$E/taker_add_invoice14.plain" 2> "$E/taker.decrypt.stderr"
+            echo $? > "$E/taker.decrypt.rc"
+            unset NOSTR_SECRET_KEY
+            timeout 40 nak req --id "$MAKER_ID" --limit 1 ws://localhost:8080 < /dev/null > "$E/maker_waiting_buyer_invoice14.json" 2> "$E/maker_waiting_buyer_invoice14.req.stderr"
+            echo $? > "$E/maker_waiting_buyer_invoice14.req.rc"
+            nak verify < "$E/maker_waiting_buyer_invoice14.json" > "$E/maker_waiting_buyer_invoice14.verify.stdout" 2> "$E/maker_waiting_buyer_invoice14.verify.stderr"
+            echo $? > "$E/maker_waiting_buyer_invoice14.verify.rc"
+            CT=$(timeout 40 nak req --id "$MAKER_ID" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2> /tmp/maker.content.err)
+            export NOSTR_SECRET_KEY="$(cat /tmp/maker.hex)"
+            nak decrypt --sender-pubkey "$DAEMON" "$CT" < /dev/null > "$E/maker_waiting_buyer_invoice14.plain" 2> "$E/maker.decrypt.stderr"
+            echo $? > "$E/maker.decrypt.rc"
+            unset NOSTR_SECRET_KEY
+            event_found=no
+            for p in $(seq 1 15); do
+              timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 --jq 'select(any(.tags[]; .[0]=="s" and .[1]=="in-progress"))' ws://localhost:8080 < /dev/null > "$E/order38383.updated.json" 2> "$E/order38383.updated.req.stderr"
+              orc=$?; echo "$orc" > "$E/order38383.updated.req.rc"
+              if [ "$orc" = 0 ] && grep -q '"kind":38383' "$E/order38383.updated.json"; then event_found=yes; break; fi
+              sleep 20
+            done
+            if [ "$event_found" = yes ]; then
+              nak verify < "$E/order38383.updated.json" > "$E/order38383.updated.verify.stdout" 2> "$E/order38383.updated.verify.stderr"
+              echo $? > "$E/order38383.updated.verify.rc"
+            else
+              FINAL=INCONCLUSIVE_ORDER_EVENT
+            fi
+          fi
+          echo "maker_reply_id=$MAKER_ID taker_reply_id=$TAKER_ID final=$FINAL"
+          echo "FINAL=$FINAL"
+          SH
+          chmod 700 "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/taker.sh"
+          cat > "$RUNNER_TEMP/addinvoice.sh" <<'SH'
+          #!/bin/sh
+          # Submit exactly one AddInvoice for the taker and capture the daemon replies.
+          set -u
+          umask 077
+          DAEMON="$1"; MAKER="$2"; TAKER="$3"; ORDER="$4"; E=/tmp/evidence
+          INVOICE=$(cat /tmp/taker_invoice.txt 2>/dev/null || true)
+          case "$ORDER" in ????????-????-????-????-????????????) ;; *) echo "FINAL=BAD_ORDER_ID"; exit 1;; esac
+          case "$INVOICE" in lnbcrt1*) ;; *) echo "FINAL=BAD_INVOICE"; exit 1;; esac
+          TSEND=$(date +%s); TSTART=$((TSEND - 10))
+          MSG=$(printf '[{"order":{"version":2,"request_id":203,"id":"%s","action":"add-invoice","payload":{"payment_request":[null,"%s",null]}}},null,null]' "$ORDER" "$INVOICE")
+          printf '%s\n' "$MSG" > "$E/taker_add_invoice_request.plain"
+          chmod 600 "$E/taker_add_invoice_request.plain"
+          export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+          CT=$(nak encrypt --recipient-pubkey "$DAEMON" "$MSG" < /dev/null)
+          nak event -k 14 -c "$CT" --tag p="$DAEMON" ws://localhost:8080 < /dev/null > /tmp/addinv.pub.out 2> /tmp/addinv.pub.err
+          echo "add_invoice_publish_rc=$?"
+          echo "add_invoice_publish_stderr=$(tr '\n' ' ' < /tmp/addinv.pub.err | cut -c1-200)"
+          cp /tmp/addinv.pub.out "$E/taker_add_invoice_request14.json"
+          nak verify < "$E/taker_add_invoice_request14.json" > "$E/taker_add_invoice_request14.verify.stdout" 2> "$E/taker_add_invoice_request14.verify.stderr"
+          echo $? > "$E/taker_add_invoice_request14.verify.rc"
+          unset NOSTR_SECRET_KEY CT MSG
+          EXPR_M="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$MAKER\"]]) and .created_at>=$TSTART) | .id"
+          EXPR_T="select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$TAKER\"]]) and .created_at>=$TSTART) | .id"
+          : > /tmp/hold.seen; : > /tmp/wait.seen
+          HOLD_ID=""; WAIT_ID=""; FINAL=WINDOW; PAYINV_NOTICES=0; DECRYPT_FAILURES=0; MAKER_CANDIDATES=0; TAKER_CANDIDATES=0
+          i=0
+          while [ $i -lt 15 ]; do
+            i=$((i+1))
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$MAKER" --limit 50 --jq "$EXPR_M" --jq-raw ws://localhost:8080 < /dev/null > /tmp/mk.cand 2> /tmp/mk.cand.err; mrc=$?
+            timeout 40 nak req -k 14 -a "$DAEMON" -t p="$TAKER" --limit 50 --jq "$EXPR_T" --jq-raw ws://localhost:8080 < /dev/null > /tmp/tk.cand 2> /tmp/tk.cand.err; trc=$?
+            echo "invoice_poll=$i maker_rc=$mrc taker_rc=$trc"
+            [ "$mrc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/mk.cand || { FINAL=QUERY_FAILED; break; }
+            [ "$trc" = 0 ] && ! grep -Evq '^[0-9a-f]{64}$' /tmp/tk.cand || { FINAL=QUERY_FAILED; break; }
+            for id in $(cat /tmp/mk.cand); do
+              grep -qx "$id" /tmp/hold.seen && continue
+              echo "$id" >> /tmp/hold.seen
+              MAKER_CANDIDATES=$((MAKER_CANDIDATES+1))
+              timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > /tmp/mk.ev 2>/dev/null || continue
+              [ -s /tmp/mk.ev ] || continue
+              nak verify < /tmp/mk.ev > /dev/null 2>&1 || continue
+              CT2=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
+              [ -n "$CT2" ] || continue
+              export NOSTR_SECRET_KEY="$(cat /tmp/maker.hex)"
+              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT2" < /dev/null > /tmp/mk.plain 2>/dev/null; DEC_RC=$?
+              unset NOSTR_SECRET_KEY
+              [ "$DEC_RC" = 0 ] || { DECRYPT_FAILURES=$((DECRYPT_FAILURES+1)); continue; }
+              grep -q '"action":"pay-invoice"' /tmp/mk.plain || continue
+              PAYINV_NOTICES=$((PAYINV_NOTICES+1))
+              grep -q 'lnbcrt1' /tmp/mk.plain || continue
+              HOLD_ID=$id
+              cp /tmp/mk.ev "$E/maker_pay_invoice14.json"
+              cp /tmp/mk.plain "$E/maker_pay_invoice14.plain"
+              printf '%s\n' "$id" > "$E/maker_pay_invoice14.id"
+              nak verify < "$E/maker_pay_invoice14.json" > "$E/maker_pay_invoice14.verify.stdout" 2> "$E/maker_pay_invoice14.verify.stderr"
+              echo $? > "$E/maker_pay_invoice14.verify.rc"
+              break
+            done
+            for id in $(cat /tmp/tk.cand); do
+              grep -qx "$id" /tmp/wait.seen && continue
+              echo "$id" >> /tmp/wait.seen
+              TAKER_CANDIDATES=$((TAKER_CANDIDATES+1))
+              timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > /tmp/tk.ev 2>/dev/null || continue
+              [ -s /tmp/tk.ev ] || continue
+              nak verify < /tmp/tk.ev > /dev/null 2>&1 || continue
+              CT3=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
+              [ -n "$CT3" ] || continue
+              export NOSTR_SECRET_KEY="$(cat /tmp/taker.hex)"
+              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$CT3" < /dev/null > /tmp/tk.plain 2>/dev/null; DEC_RC=$?
+              unset NOSTR_SECRET_KEY
+              [ "$DEC_RC" = 0 ] || { DECRYPT_FAILURES=$((DECRYPT_FAILURES+1)); continue; }
+              grep -q '"action":"waiting-seller-to-pay"' /tmp/tk.plain || continue
+              WAIT_ID=$id
+              cp /tmp/tk.ev "$E/taker_waiting_seller_to_pay14.json"
+              cp /tmp/tk.plain "$E/taker_waiting_seller_to_pay14.plain"
+              printf '%s\n' "$id" > "$E/taker_waiting_seller_to_pay14.id"
+              nak verify < "$E/taker_waiting_seller_to_pay14.json" > "$E/taker_waiting_seller_to_pay14.verify.stdout" 2> "$E/taker_waiting_seller_to_pay14.verify.stderr"
+              echo $? > "$E/taker_waiting_seller_to_pay14.verify.rc"
+              break
+            done
+            [ -n "$HOLD_ID" ] && [ -n "$WAIT_ID" ] && break
+            sleep 20
+          done
+          if [ -n "$HOLD_ID" ] && [ -n "$WAIT_ID" ]; then FINAL=SELECTED
+          elif [ -z "$HOLD_ID" ]; then FINAL=MISSING_HOLD_INVOICE
+          else FINAL=MISSING_WAITING_SELLER
+          fi
+          if [ "$FINAL" = SELECTED ]; then
+            timeout 40 nak -v req -k 38383 -a "$DAEMON" -t d="$ORDER" --limit 5 ws://localhost:8080 < /dev/null > /tmp/raw38383.json 2> "$E/order38383.waitingpayment.req.stderr"
+            orc=$?; echo "$orc" > "$E/order38383.waitingpayment.req.rc"
+            jq -sc '{count: length, events: [.[]? | {id: .id, created_at: .created_at, pubkey: .pubkey, kind: .kind, d: ([.tags[]? | select(.[0]=="d") | .[1]][0] // null), s: ([.tags[]? | select(.[0]=="s") | .[1]][0] // null)}]}' /tmp/raw38383.json > "$E/order38383.waitingpayment.meta.json" 2>/dev/null || true
+            nod_rc=0
+            timeout 40 nak req -k 38383 -a "$DAEMON" --limit 50 ws://localhost:8080 < /dev/null > /tmp/raw38383_nod.json 2>/dev/null || nod_rc=$?
+            if ! jq -sc --arg d "$ORDER" --argjson rc "$nod_rc" '{req_rc: $rc, count: length, d_match: ([.[]? | select(([.tags[]? | select(.[0]=="d") | .[1]][0] // "") == $d)] | length), events: [.[]? | select(([.tags[]? | select(.[0]=="d") | .[1]][0] // "") == $d) | {id: .id, created_at: .created_at, pubkey: .pubkey, kind: .kind, s: ([.tags[]? | select(.[0]=="s") | .[1]][0] // null)}]}' /tmp/raw38383_nod.json > "$E/order38383.waitingpayment.nod.meta.json" 2>/dev/null; then
+              printf '{"req_rc":%s,"invalid":true}\n' "$nod_rc" > "$E/order38383.waitingpayment.nod.meta.json"
+            fi
+            rm -f /tmp/raw38383_nod.json /tmp/raw38383.json
+          fi
+          echo "pay_invoice_notices=$PAYINV_NOTICES maker_candidates=$MAKER_CANDIDATES taker_candidates=$TAKER_CANDIDATES decrypt_failures=$DECRYPT_FAILURES hold_invoice_selected=$HOLD_ID waiting_seller_selected=$WAIT_ID"
+          echo "FINAL=$FINAL"
+          SH
+          chmod 700 "$RUNNER_TEMP/addinvoice.sh"
+      - name: Run single maker NewOrder and capture ACK
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
+          docker cp "$RUNNER_TEMP/maker.hex" "$cid:/tmp/maker.hex"
+          docker cp "$RUNNER_TEMP/taker.hex" "$cid:/tmp/taker.hex"
+          docker cp "$RUNNER_TEMP/maker.sh" "$cid:/tmp/maker.sh"
+          docker cp "$RUNNER_TEMP/taker.sh" "$cid:/tmp/taker.sh"
+          daemon=$(cat "$RUNNER_TEMP/daemon.pub"); maker=$(cat "$RUNNER_TEMP/maker.pub"); taker=$(cat "$RUNNER_TEMP/taker.pub")
+          timeout 900 docker compose exec -T nostr_relay sh /tmp/maker.sh "$daemon" "$maker" > "$RUNNER_TEMP/maker.out" 2> "$RUNNER_TEMP/maker.err"
+          echo "maker script rc=$?"
+          cat "$RUNNER_TEMP/maker.out"
+          rm -rf "$RUNNER_TEMP/evidence"
+          docker cp "$cid:/tmp/evidence" "$RUNNER_TEMP/"
+          order=$(cat "$RUNNER_TEMP/evidence/order_id.txt" 2>/dev/null || true)
+          echo "order id present=$([ -n "$order" ] && echo yes || echo no)"
+          printf '%s' "$order" > "$RUNNER_TEMP/order_id.txt"
+      - name: Run exactly one taker TakeSell and capture both responses
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          order=$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || true)
+          if [ -z "$order" ]; then echo "FINAL=INCONCLUSIVE_NO_ORDER_ID"; exit 0; fi
+          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
+          daemon=$(cat "$RUNNER_TEMP/daemon.pub"); maker=$(cat "$RUNNER_TEMP/maker.pub"); taker=$(cat "$RUNNER_TEMP/taker.pub")
+          timeout 900 docker compose exec -T nostr_relay sh /tmp/taker.sh "$daemon" "$maker" "$taker" "$order" > "$RUNNER_TEMP/taker.out" 2> "$RUNNER_TEMP/taker.err"
+          echo "taker script rc=$?"
+          cat "$RUNNER_TEMP/taker.out"
+          docker cp "$cid:/tmp/evidence/." "$RUNNER_TEMP/evidence/"
+      - name: Run exactly one taker AddInvoice and capture seller hold invoice
+        if: always()
+        continue-on-error: true
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          order=$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || true)
+          if [ -z "$order" ] || [ ! -s "$RUNNER_TEMP/taker_invoice.txt" ]; then echo "FINAL=INCONCLUSIVE_NO_ORDER_ID"; exit 0; fi
+          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
+          docker cp "$RUNNER_TEMP/addinvoice.sh" "$cid:/tmp/addinvoice.sh"
+          docker cp "$RUNNER_TEMP/taker_invoice.txt" "$cid:/tmp/taker_invoice.txt"
+          daemon=$(cat "$RUNNER_TEMP/daemon.pub"); maker=$(cat "$RUNNER_TEMP/maker.pub"); taker=$(cat "$RUNNER_TEMP/taker.pub")
+          timeout 900 docker compose exec -T nostr_relay sh /tmp/addinvoice.sh "$daemon" "$maker" "$taker" "$order" > "$RUNNER_TEMP/addinvoice.out" 2> "$RUNNER_TEMP/addinvoice.err"
+          echo "addinvoice script rc=$?"
+          cat "$RUNNER_TEMP/addinvoice.out"
+          docker cp "$cid:/tmp/evidence/." "$RUNNER_TEMP/evidence/"
+
+      - name: Phase 5A preflight - identities, network and invoice checks
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          umask 077
+          ln_alice() { docker compose exec -T --user lnd alice_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_bob() { docker compose exec -T --user lnd bob_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_mostro() { docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          E="$RUNNER_TEMP/evidence"
+          test -s "$E/maker_pay_invoice14.plain"
+          test -s "$RUNNER_TEMP/taker_invoice.txt"
+          ORDER=$(jq -r '.[0].order.id' "$E/maker_pay_invoice14.plain")
+          HOLD=$(jq -r '.[0].order.payload.payment_request[1]' "$E/maker_pay_invoice14.plain")
+          EXPECTED=$(jq -r '.[0].order.payload.payment_request[0].amount' "$E/maker_pay_invoice14.plain")
+          PAYOUT=$(cat "$RUNNER_TEMP/taker_invoice.txt")
+          [ "${#ORDER}" = 36 ] || { echo 'FAIL: invalid order id'; exit 1; }
+          case "$HOLD" in lnbcrt1*) ;; *) echo 'FAIL: hold invoice is not regtest'; exit 1;; esac
+          case "$PAYOUT" in lnbcrt1*) ;; *) echo 'FAIL: payout invoice is not regtest'; exit 1;; esac
+          [ "$EXPECTED" -gt 0 ] || { echo 'FAIL: invalid hold amount'; exit 1; }
+          SELLER_ID=$(ln_alice getinfo | jq -r .identity_pubkey)
+          BUYER_ID=$(ln_bob getinfo | jq -r .identity_pubkey)
+          DAEMON_ID=$(ln_mostro getinfo | jq -r .identity_pubkey)
+          [ "$SELLER_ID" != "$BUYER_ID" ] || { echo 'FAIL: duplicate seller/buyer LND'; exit 1; }
+          [ "$SELLER_ID" != "$DAEMON_ID" ] || { echo 'FAIL: seller is daemon'; exit 1; }
+          [ "$BUYER_ID" != "$DAEMON_ID" ] || { echo 'FAIL: buyer is daemon'; exit 1; }
+          for pair in alice_lnd:"$SELLER_ID" bob_lnd:"$BUYER_ID" mostro_lnd:"$DAEMON_ID"; do
+            svc=${pair%%:*}
+            case "$svc" in
+              alice_lnd) gi=$(ln_alice getinfo);;
+              bob_lnd) gi=$(ln_bob getinfo);;
+              mostro_lnd) gi=$(ln_mostro getinfo);;
+            esac
+            printf '%s' "$gi" | jq -e '.chains | index("bitcoin") != null' >/dev/null || { echo "FAIL: $svc not bitcoin"; exit 1; }
+            printf '%s' "$gi" | jq -e '.networks | index("regtest") != null' >/dev/null || { echo "FAIL: $svc not regtest"; exit 1; }
+            [ "$(printf '%s' "$gi" | jq -r .synced_to_chain)" = true ] || { echo "FAIL: $svc not synced"; exit 1; }
+          done
+          [ "$(ln_alice listchannels | jq '.channels|length')" = 0 ] || { echo 'FAIL: seller already has channel'; exit 1; }
+          [ "$(ln_bob listchannels | jq '.channels|length')" = 0 ] || { echo 'FAIL: buyer already has channel'; exit 1; }
+          [ "$(ln_mostro listchannels | jq '.channels|length')" = 0 ] || { echo 'FAIL: daemon already has channel'; exit 1; }
+          [ "$(ln_alice listpayments --include_incomplete | jq '.payments|length')" = 0 ] || { echo 'FAIL: seller already has payment'; exit 1; }
+          HOLD_INFO=$(ln_mostro decodepayreq "$HOLD")
+          HOLD_DEST=$(printf '%s' "$HOLD_INFO" | jq -r .destination)
+          HOLD_AMT=$(printf '%s' "$HOLD_INFO" | jq -r .num_satoshis)
+          HOLD_HASH=$(printf '%s' "$HOLD_INFO" | jq -r .payment_hash)
+          [ "$HOLD_DEST" = "$DAEMON_ID" ] || { echo 'FAIL: hold destination is not mostro_lnd'; exit 1; }
+          [ "$HOLD_AMT" = "$EXPECTED" ] || { echo 'FAIL: hold amount mismatch'; exit 1; }
+          [ "$(ln_mostro lookupinvoice "$HOLD_HASH" | jq -r .state)" = OPEN ] || { echo 'FAIL: hold not OPEN pre-payment'; exit 1; }
+          PAYOUT_INFO=$(ln_bob decodepayreq "$PAYOUT")
+          PAYOUT_DEST=$(printf '%s' "$PAYOUT_INFO" | jq -r .destination)
+          PAYOUT_AMT=$(printf '%s' "$PAYOUT_INFO" | jq -r .num_satoshis)
+          PAYOUT_HASH=$(printf '%s' "$PAYOUT_INFO" | jq -r .payment_hash)
+          [ "$PAYOUT_DEST" = "$BUYER_ID" ] || { echo 'FAIL: payout destination is not bob_lnd'; exit 1; }
+          [ "$PAYOUT_AMT" -gt 0 ] || { echo 'FAIL: invalid payout amount'; exit 1; }
+          [ "$(ln_bob lookupinvoice "$PAYOUT_HASH" | jq -r .state)" = OPEN ] || { echo 'FAIL: payout not OPEN'; exit 1; }
+          {
+            printf 'ORDER=%s\n' "$ORDER"
+            printf 'EXPECTED=%s\n' "$EXPECTED"
+            printf 'SELLER_ID=%s\n' "$SELLER_ID"
+            printf 'BUYER_ID=%s\n' "$BUYER_ID"
+            printf 'DAEMON_ID=%s\n' "$DAEMON_ID"
+            printf 'HOLD_HASH=%s\n' "$HOLD_HASH"
+            printf 'PAYOUT_HASH=%s\n' "$PAYOUT_HASH"
+            printf 'PAYOUT_AMT=%s\n' "$PAYOUT_AMT"
+          } > "$RUNNER_TEMP/stagea_vars"
+          printf '%s\n' "$HOLD" > "$RUNNER_TEMP/stagea_hold"
+          printf '%s\n' "$PAYOUT" > "$RUNNER_TEMP/stagea_payout"
+          chmod 600 "$RUNNER_TEMP/stagea_vars" "$RUNNER_TEMP/stagea_hold" "$RUNNER_TEMP/stagea_payout"
+          echo "preflight ok: seller=alice_lnd buyer=bob_lnd daemon=mostro_lnd hold_state=OPEN payout_state=OPEN expected_sats=$EXPECTED"
+      - name: Phase 5A - fund seller and open exactly one regtest channel
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          umask 077
+          source "$RUNNER_TEMP/stagea_vars"
+          ln_alice() { docker compose exec -T --user lnd alice_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_bob() { docker compose exec -T --user lnd bob_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_mostro() { docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          bc() { docker compose exec -T --user bitcoin bitcoin bitcoin-cli -regtest -rpcport=18443 -rpcuser=bitcoin -rpcpassword=bitcoin "$@"; }
+          wait_sync() {
+            svc=$1
+            for i in $(seq 1 120); do
+              case "$svc" in
+                alice_lnd) gi=$(ln_alice getinfo);;
+                bob_lnd) gi=$(ln_bob getinfo);;
+                mostro_lnd) gi=$(ln_mostro getinfo);;
+              esac
+              [ "$(printf '%s' "$gi" | jq -r .synced_to_chain)" = true ] && return 0
+              sleep 2
+            done
+            return 1
+          }
+          addr=$(ln_alice newaddress p2wkh | jq -r .address)
+          bc -rpcwallet=dev sendtoaddress "$addr" 0.1 >/dev/null
+          mine=$(bc -rpcwallet=dev getnewaddress)
+          bc -rpcwallet=dev generatetoaddress 3 "$mine" >/dev/null
+          wait_sync alice_lnd; wait_sync mostro_lnd; wait_sync bob_lnd
+          ln_alice connect "$DAEMON_ID@mostro_lnd" >/dev/null
+          ln_alice openchannel "$DAEMON_ID" 1000000 0 >/dev/null
+          bc -rpcwallet=dev generatetoaddress 6 "$mine" >/dev/null
+          ch=0; dch=0; pend=1; dpend=1
+          for i in $(seq 1 120); do
+            ch=$(ln_alice listchannels | jq --arg id "$DAEMON_ID" '[.channels[]|select(.remote_pubkey==$id and .active==true)]|length')
+            dch=$(ln_mostro listchannels | jq --arg id "$SELLER_ID" '[.channels[]|select(.remote_pubkey==$id and .active==true)]|length')
+            pend=$(ln_alice pendingchannels | jq '((.pending_open_channels|length)+(.pending_closing_channels|length)+(.pending_force_closing_channels|length)+(.waiting_close_channels|length))')
+            dpend=$(ln_mostro pendingchannels | jq '((.pending_open_channels|length)+(.pending_closing_channels|length)+(.pending_force_closing_channels|length)+(.waiting_close_channels|length))')
+            [ "$ch" = 1 ] && [ "$dch" = 1 ] && [ "$pend" = 0 ] && [ "$dpend" = 0 ] && break
+            sleep 2
+          done
+          [ "$ch" = 1 ] || { echo 'FAIL: seller channel not active'; exit 1; }
+          [ "$dch" = 1 ] || { echo 'FAIL: daemon channel not active'; exit 1; }
+          [ "$pend" = 0 ] || { echo 'FAIL: seller pending channel'; exit 1; }
+          [ "$dpend" = 0 ] || { echo 'FAIL: daemon pending channel'; exit 1; }
+          [ "$(ln_alice listchannels | jq '.channels|length')" = 1 ] || { echo 'FAIL: seller extra channels'; exit 1; }
+          [ "$(ln_mostro listchannels | jq '.channels|length')" = 1 ] || { echo 'FAIL: daemon extra channels'; exit 1; }
+          [ "$(ln_bob listchannels | jq '.channels|length')" = 0 ] || { echo 'FAIL: buyer channel exists'; exit 1; }
+          [ "$(ln_bob pendingchannels | jq '((.pending_open_channels|length)+(.pending_closing_channels|length)+(.pending_force_closing_channels|length)+(.waiting_close_channels|length))')" = 0 ] || { echo 'FAIL: buyer pending channel'; exit 1; }
+          alice_point=$(ln_alice listchannels | jq -r --arg id "$DAEMON_ID" '.channels[]|select(.remote_pubkey==$id and .active==true)|.channel_point')
+          daemon_point=$(ln_mostro listchannels | jq -r --arg id "$SELLER_ID" '.channels[]|select(.remote_pubkey==$id and .active==true)|.channel_point')
+          [ -n "$alice_point" ] && [ "$alice_point" = "$daemon_point" ] || { echo 'FAIL: channel point/peer mismatch'; exit 1; }
+          [ "$(ln_alice listpayments --include_incomplete | jq '.payments|length')" = 0 ] || { echo 'FAIL: seller already paid'; exit 1; }
+          [ "$(ln_bob listpayments --include_incomplete | jq '.payments|length')" = 0 ] || { echo 'FAIL: buyer already paid'; exit 1; }
+          local=$(ln_alice channelbalance | jq -r '.local_balance.sat')
+          [ "$local" -ge "$EXPECTED" ] || { echo 'FAIL: seller channel liquidity'; exit 1; }
+          printf 'CHANNEL_COUNT=1\nCHANNEL_LOCAL=%s\n' "$local" >> "$RUNNER_TEMP/stagea_vars"
+          echo "channel ok: seller<->daemon active both sides local_sats=$local"
+      - name: Phase 5A - pay exactly once, capture ACCEPTED/IN_FLIGHT and Active DMs
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          umask 077
+          source "$RUNNER_TEMP/stagea_vars"
+          HOLD=$(cat "$RUNNER_TEMP/stagea_hold")
+          ln_alice() { docker compose exec -T --user lnd alice_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_bob() { docker compose exec -T --user lnd bob_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_mostro() { docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          TSTART=$(date +%s)
+          printf '%s\n' "$TSTART" > "$RUNNER_TEMP/stagea_tstart"
+          ( ln_alice payinvoice --force --pay_req "$HOLD" --timeout 600s --json --inflight_updates > "$RUNNER_TEMP/alice_pay.out" 2> "$RUNNER_TEMP/alice_pay.err" ) &
+          PAY_PID=$!
+          printf '%s\n' "$PAY_PID" > "$RUNNER_TEMP/stagea_pay_pid"
+          state=OPEN; count=0; total=0; status=missing
+          for i in $(seq 1 90); do
+            state=$(ln_mostro lookupinvoice "$HOLD_HASH" | jq -r .state 2>/dev/null || echo error)
+            pay=$(ln_alice listpayments --include_incomplete 2>/dev/null || echo '{}')
+            count=$(printf '%s' "$pay" | jq --arg h "$HOLD_HASH" '[.payments[]?|select(.payment_hash==$h)]|length' 2>/dev/null || echo 0)
+            total=$(printf '%s' "$pay" | jq '.payments|length' 2>/dev/null || echo 0)
+            status=$(printf '%s' "$pay" | jq -r --arg h "$HOLD_HASH" '[.payments[]?|select(.payment_hash==$h)]|.[0].status // "missing"' 2>/dev/null || echo missing)
+            if [ "$total" -gt 1 ]; then echo "FAIL: extra unrelated seller payment (total=$total)"; exit 1; fi
+            if [ "$state" = ACCEPTED ] && [ "$total" = 1 ] && [ "$count" = 1 ] && [ "$status" = IN_FLIGHT ]; then break; fi
+            if [ "$state" = SETTLED ] || [ "$state" = CANCELED ] || [ "$count" -gt 1 ]; then echo "FAIL: unexpected hold/payment state=$state count=$count status=$status"; exit 1; fi
+            sleep 2
+          done
+          [ "$state" = ACCEPTED ] && [ "$total" = 1 ] && [ "$count" = 1 ] && [ "$status" = IN_FLIGHT ] || { echo "FAIL: ACCEPTED/IN_FLIGHT not observed state=$state total=$total count=$count status=$status"; exit 1; }
+          PAYOUT_STATE=$(ln_bob lookupinvoice "$PAYOUT_HASH" | jq -r .state)
+          BUYER_PAYMENTS=$(ln_bob listpayments --include_incomplete | jq '.payments|length')
+          [ "$PAYOUT_STATE" = OPEN ] || { echo 'FAIL: buyer payout not OPEN'; exit 1; }
+          [ "$BUYER_PAYMENTS" = 0 ] || { echo 'FAIL: buyer has payments'; exit 1; }
+          {
+            printf 'HOLD_STATE=%s\n' "$state"
+            printf 'SELLER_PAYMENT_COUNT=%s\n' "$count"
+            printf 'SELLER_TOTAL_PAYMENTS=%s\n' "$total"
+            printf 'SELLER_PAYMENT_STATUS=%s\n' "$status"
+            printf 'PAYOUT_STATE=%s\n' "$PAYOUT_STATE"
+            printf 'BUYER_PAYMENT_COUNT=%s\n' "$BUYER_PAYMENTS"
+          } > "$RUNNER_TEMP/stagea_payment_state"
+          cat > "$RUNNER_TEMP/stagea_dm.sh" <<'SH'
+          #!/bin/sh
+          set -u
+          DAEMON="$1"; MAKER="$2"; TAKER="$3"; ORDER="$4"; TSTART="$5"
+          d=/tmp/stagea_dm; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
+          check() {
+            recipient="$1"; keyfile="$2"; action="$3"
+            ids=$(timeout 40 nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null | sort -u)
+            n=0
+            for id in $ids; do
+              timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > "$d/$id.json" 2>/dev/null || continue
+              nak verify < "$d/$id.json" >/dev/null 2>&1 || continue
+              ct=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null) || continue
+              export NOSTR_SECRET_KEY="$(cat "$keyfile")"
+              timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null > "$d/$id.plain" 2>/dev/null || { unset NOSTR_SECRET_KEY; continue; }
+              unset NOSTR_SECRET_KEY
+              jq -e --arg a "$action" --arg o "$ORDER" '.[0].order.action==$a and .[0].order.id==$o and .[0].order.status=="active"' "$d/$id.plain" >/dev/null 2>&1 || continue
+              n=$((n+1))
+            done
+            printf '%s=%s\n' "$action" "$n"
+            [ "$n" = 1 ]
+          }
+          check "$MAKER" /tmp/maker.hex buyer-took-order || exit 1
+          check "$TAKER" /tmp/taker.hex hold-invoice-payment-accepted || exit 1
+          SH
+          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
+          docker cp "$RUNNER_TEMP/stagea_dm.sh" "$cid:/tmp/stagea_dm.sh"
+          docker exec "$cid" sh -c 'rm -rf /tmp/stagea_dm'
+          docker compose exec -T nostr_relay sh /tmp/stagea_dm.sh "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err"
+          cat "$RUNNER_TEMP/stagea_dm.out"
+          ln_mostro cancelinvoice "$HOLD_HASH" >/dev/null 2>&1 || true
+          cancel_state=missing
+          for i in $(seq 1 60); do
+            cancel_state=$(ln_mostro lookupinvoice "$HOLD_HASH" | jq -r .state 2>/dev/null || echo error)
+            [ "$cancel_state" = CANCELED ] && break
+            sleep 2
+          done
+          [ "$cancel_state" = CANCELED ] || { echo 'FAIL: hold invoice not CANCELED'; exit 1; }
+          pay='{}'
+          for i in $(seq 1 60); do
+            pay=$(ln_alice listpayments --include_incomplete 2>/dev/null || echo '{}')
+            inflight=$(printf '%s' "$pay" | jq --arg h "$HOLD_HASH" '[.payments[]?|select(.payment_hash==$h and .status=="IN_FLIGHT")]|length')
+            [ "$inflight" = 0 ] && break
+            sleep 2
+          done
+          [ "$(printf '%s' "$pay" | jq --arg h "$HOLD_HASH" '[.payments[]?|select(.payment_hash==$h and .status=="IN_FLIGHT")]|length')" = 0 ] || { echo 'FAIL: seller payment still IN_FLIGHT after cancel'; exit 1; }
+          [ "$(ln_bob lookupinvoice "$PAYOUT_HASH" | jq -r .state)" = OPEN ] || { echo 'FAIL: buyer payout changed'; exit 1; }
+          printf 'CANCEL_STATE=%s\n' "$cancel_state" >> "$RUNNER_TEMP/stagea_payment_state"
+          if [ -n "${PAY_PID:-}" ]; then kill "$PAY_PID" 2>/dev/null || true; wait "$PAY_PID" 2>/dev/null || true; fi
+          echo "payment/cancel ok: state=ACCEPTED seller_payment_count=1 seller_status=IN_FLIGHT payout=OPEN cancel=CANCELED"
+      - name: Phase 5A gate and sanitized manifest
+        id: stagea_gate
+        if: always()
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          umask 077
+          ln_alice() { docker compose exec -T --user lnd alice_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_bob() { docker compose exec -T --user lnd bob_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          ln_mostro() { docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+          source "$RUNNER_TEMP/stagea_vars"
+          source "$RUNNER_TEMP/stagea_payment_state"
+          DM=$(cat "$RUNNER_TEMP/stagea_dm.out" 2>/dev/null || true)
+          [ "$(printf '%s\n' "$DM" | grep -c '^buyer-took-order=1$')" = 1 ] || { echo 'FAIL: buyer-took-order count'; exit 1; }
+          [ "$(printf '%s\n' "$DM" | grep -c '^hold-invoice-payment-accepted=1$')" = 1 ] || { echo 'FAIL: hold-invoice-payment-accepted count'; exit 1; }
+          [ "$HOLD_STATE" = ACCEPTED ] || { echo 'FAIL: captured hold not ACCEPTED'; exit 1; }
+          [ "$SELLER_PAYMENT_COUNT" = 1 ] || { echo 'FAIL: seller payment count'; exit 1; }
+          [ "$SELLER_TOTAL_PAYMENTS" = 1 ] || { echo 'FAIL: seller total payments'; exit 1; }
+          [ "$SELLER_PAYMENT_STATUS" = IN_FLIGHT ] || { echo 'FAIL: seller payment not IN_FLIGHT'; exit 1; }
+          [ "$PAYOUT_STATE" = OPEN ] || { echo 'FAIL: captured payout not OPEN'; exit 1; }
+          [ "$CANCEL_STATE" = CANCELED ] || { echo 'FAIL: cancel state'; exit 1; }
+          [ "$(ln_mostro lookupinvoice "$HOLD_HASH" | jq -r .state)" = CANCELED ] || { echo 'FAIL: hold not CANCELED'; exit 1; }
+          [ "$(ln_alice listpayments --include_incomplete | jq '.payments|length')" = 1 ] || { echo 'FAIL: seller total payment count'; exit 1; }
+          [ "$(ln_alice listpayments --include_incomplete | jq --arg h "$HOLD_HASH" '[.payments[]?|select(.payment_hash==$h and .status=="IN_FLIGHT")]|length')" = 0 ] || { echo 'FAIL: seller still IN_FLIGHT'; exit 1; }
+          [ "$(ln_bob lookupinvoice "$PAYOUT_HASH" | jq -r .state)" = OPEN ] || { echo 'FAIL: payout not OPEN'; exit 1; }
+          [ "$(ln_alice listchannels | jq '.channels|length')" = 1 ] || { echo 'FAIL: seller channel count'; exit 1; }
+          [ "$(ln_mostro listchannels | jq '.channels|length')" = 1 ] || { echo 'FAIL: daemon channel count'; exit 1; }
+          [ "$(ln_bob listchannels | jq '.channels|length')" = 0 ] || { echo 'FAIL: buyer channel count'; exit 1; }
+          alice_active=$(ln_alice listchannels | jq --arg id "$DAEMON_ID" '[.channels[]|select(.remote_pubkey==$id and .active==true)]|length')
+          daemon_active=$(ln_mostro listchannels | jq --arg id "$SELLER_ID" '[.channels[]|select(.remote_pubkey==$id and .active==true)]|length')
+          alice_point=$(ln_alice listchannels | jq -r --arg id "$DAEMON_ID" '.channels[]|select(.remote_pubkey==$id and .active==true)|.channel_point')
+          daemon_point=$(ln_mostro listchannels | jq -r --arg id "$SELLER_ID" '.channels[]|select(.remote_pubkey==$id and .active==true)|.channel_point')
+          [ "$alice_active" = 1 ] || { echo 'FAIL: seller active channel/peer'; exit 1; }
+          [ "$daemon_active" = 1 ] || { echo 'FAIL: daemon active channel/peer'; exit 1; }
+          [ -n "$alice_point" ] && [ "$alice_point" = "$daemon_point" ] || { echo 'FAIL: channel point mismatch'; exit 1; }
+          [ "$(ln_alice pendingchannels | jq '((.pending_open_channels|length)+(.pending_closing_channels|length)+(.pending_force_closing_channels|length)+(.waiting_close_channels|length))')" = 0 ] || { echo 'FAIL: seller pending channels'; exit 1; }
+          [ "$(ln_mostro pendingchannels | jq '((.pending_open_channels|length)+(.pending_closing_channels|length)+(.pending_force_closing_channels|length)+(.waiting_close_channels|length))')" = 0 ] || { echo 'FAIL: daemon pending channels'; exit 1; }
+          [ "$(ln_bob pendingchannels | jq '((.pending_open_channels|length)+(.pending_closing_channels|length)+(.pending_force_closing_channels|length)+(.waiting_close_channels|length))')" = 0 ] || { echo 'FAIL: buyer pending channels'; exit 1; }
+          mkdir -p "$RUNNER_TEMP/safe-artifact"; chmod 700 "$RUNNER_TEMP/safe-artifact"
+          python3 - "$ORDER" "$EXPECTED" "$SELLER_ID" "$BUYER_ID" "$DAEMON_ID" "$HOLD_STATE" "$SELLER_PAYMENT_COUNT" "$SELLER_TOTAL_PAYMENTS" "$SELLER_PAYMENT_STATUS" "$PAYOUT_STATE" "$CANCEL_STATE" "$CHANNEL_LOCAL" "$RUNNER_TEMP/stagea_hold" "$RUNNER_TEMP/stagea_payout" "$RUNNER_TEMP/safe-artifact/manifest.json" <<'PY'
+          import hashlib, json, pathlib, re, sys
+          order, expected, seller, buyer, daemon, hold_state, pay_count, pay_total, pay_status, payout_state, cancel_state, channel_local, hold_path, payout_path, out_path = sys.argv[1:]
+          def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+          hold_sha=sha(hold_path); payout_sha=sha(payout_path)
+          assert re.fullmatch(r'[0-9a-f]{64}', hold_sha) and re.fullmatch(r'[0-9a-f]{64}', payout_sha)
+          assert re.fullmatch(r'[0-9a-f]{66}', seller) and re.fullmatch(r'[0-9a-f]{66}', buyer) and re.fullmatch(r'[0-9a-f]{66}', daemon)
+          manifest={
+            'schema':'phase5a-hold-invoice-active-v1',
+            'run_id':__import__('os').environ.get('GITHUB_RUN_ID',''),
+            'source':{'satonero':'2534f8b0f05ade36007445511e02747f4468109a','regtest':'c6adbdaaaf0a2152a0728dbce6adf11945f547bd','nak':'v0.22.2'},
+            'order_id':order,
+            'roles':{'seller':'alice_lnd','buyer':'bob_lnd','daemon':'mostro_lnd'},
+            'lnd_identities':{'seller':seller,'buyer':buyer,'daemon':daemon},
+            'hold_invoice_sha256':hold_sha,
+            'payout_invoice_sha256':payout_sha,
+            'hold_state':hold_state,
+            'seller_payment':{'count':int(pay_count),'total':int(pay_total),'status':pay_status},
+            'buyer_payout_state':payout_state,
+            'channel_count':1,
+            'channel_local_sats':int(channel_local),
+            'messages':{'buyer_took_order':1,'hold_invoice_payment_accepted':1},
+            'order_status':'active',
+            'cancellation':cancel_state,
+            'limits':{'channels':1,'payments':1,'settled':0,'payouts':0},
+          }
+          text=json.dumps(manifest,sort_keys=True)
+          for bad in ('lnbcrt1','lnbc1','nsec1','macaroon','preimage','payment_request','BEGIN '):
+              assert bad.lower() not in text.lower(), bad
+          pathlib.Path(out_path).write_text(text+'\n')
+          print('manifest ok: hold_state=%s seller_payment=%s/%s payout=%s cancel=%s' % (hold_state,pay_count,pay_status,payout_state,cancel_state))
+          PY
+          test "$(find "$RUNNER_TEMP/safe-artifact" -maxdepth 1 -type f | wc -l)" = 1
+          test -s "$RUNNER_TEMP/safe-artifact/manifest.json"
+          echo 'gate=pass' >> "$GITHUB_OUTPUT"
+      - name: Upload Phase 5A sanitized evidence
+        id: stagea_upload
+        if: steps.stagea_gate.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase5a-hold-invoice-active-evidence
+          path: ${{ runner.temp }}/safe-artifact/manifest.json
+          if-no-files-found: error
+      - name: Cleanup (always)
+        id: stagea_cleanup
+        if: always()
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          umask 077
+          if [ -f "$RUNNER_TEMP/stagea_pay_pid" ]; then
+            pid=$(cat "$RUNNER_TEMP/stagea_pay_pid" 2>/dev/null || true)
+            [ -n "$pid" ] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+          fi
+          if [ -f "$RUNNER_TEMP/stagea_vars" ]; then
+            source "$RUNNER_TEMP/stagea_vars"
+            ln_mostro() { docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+            ln_alice() { docker compose exec -T --user lnd alice_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
+            resolution_ok=1
+            if [ -n "${HOLD_HASH:-}" ]; then
+              state=$(ln_mostro lookupinvoice "$HOLD_HASH" 2>/dev/null | jq -r .state 2>/dev/null || echo error)
+              if [ "$state" = ACCEPTED ] || [ "$state" = OPEN ]; then
+                ln_mostro cancelinvoice "$HOLD_HASH" >/dev/null 2>&1 || true
+              fi
+              for i in $(seq 1 60); do
+                state=$(ln_mostro lookupinvoice "$HOLD_HASH" 2>/dev/null | jq -r .state 2>/dev/null || echo error)
+                [ "$state" = CANCELED ] && break
+                sleep 1
+              done
+              [ "$state" = CANCELED ] || { echo "FAIL: hold invoice state=$state"; resolution_ok=0; }
+              pay='{}'
+              for i in $(seq 1 60); do
+                pay=$(ln_alice listpayments --include_incomplete 2>/dev/null || echo '{}')
+                inflight=$(printf '%s' "$pay" | jq --arg h "$HOLD_HASH" '[.payments[]?|select(.payment_hash==$h and .status=="IN_FLIGHT")]|length')
+                [ "$inflight" = 0 ] && break
+                sleep 1
+              done
+              [ "$(printf '%s' "$pay" | jq --arg h "$HOLD_HASH" '[.payments[]?|select(.payment_hash==$h and .status=="IN_FLIGHT")]|length')" = 0 ] || { echo 'FAIL: seller payment unresolved'; resolution_ok=0; }
+            else
+              resolution_ok=0
+            fi
+          else
+            resolution_ok=0
+          fi
+          cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
+          if [ -n "$cid" ]; then docker exec "$cid" sh -c 'rm -rf /tmp/stagea_dm /tmp/stagea_dm.sh' || true; fi
+          rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/safe-artifact" "$RUNNER_TEMP/stagea_dm.sh" "$RUNNER_TEMP/stagea_hold" "$RUNNER_TEMP/stagea_payout" "$RUNNER_TEMP/stagea_vars" "$RUNNER_TEMP/stagea_payment_state" "$RUNNER_TEMP/stagea_tstart" "$RUNNER_TEMP/stagea_pay_pid" "$RUNNER_TEMP/stagea_dm.out" "$RUNNER_TEMP/stagea_dm.err" "$RUNNER_TEMP/alice_pay.out" "$RUNNER_TEMP/alice_pay.err" "$RUNNER_TEMP/taker_invoice.txt" "$RUNNER_TEMP/addinvoice.sh" "$RUNNER_TEMP/addinvoice.out" "$RUNNER_TEMP/addinvoice.err" "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/taker.hex" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/taker.pub" "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/taker.sh" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/shape.txt" "$RUNNER_TEMP/secret_gate.txt" || true
+          docker rm -f satonero-daemon >/dev/null 2>&1 || true
+          docker volume rm satonero-config >/dev/null 2>&1 || true
+          docker compose down -v || true
+          docker system prune -af --volumes || true
+          cleanup_failed=0
+          [ "${resolution_ok:-0}" = 1 ] || cleanup_failed=1
+          verify_absent() { label=$1; shift; if output=$("$@" 2>/dev/null); then if [ -z "$output" ]; then echo "absence confirmed: $label"; else echo "resource remains: $label"; cleanup_failed=1; fi; else rc=$?; echo "inspection failed: $label rc=$rc"; cleanup_failed=1; fi; }
+          verify_absent 'satonero daemon containers' docker ps -a -q --filter name=satonero-daemon
+          verify_absent 'satonero config volumes' docker volume ls -q --filter name=satonero-config
+          verify_absent 'regtest containers' docker ps -a -q --filter name=mostro-regtest-
+          verify_absent 'regtest volumes' docker volume ls -q --filter name=mostro-regtest_
+          if python3 - "$RUNNER_TEMP" <<'PY'
+          import pathlib, sys
+          root=pathlib.Path(sys.argv[1])
+          names=('maker.hex','taker.hex','daemon.nsec','maker.pub','taker.pub','daemon.pub','settings.toml','maker.sh','taker.sh','addinvoice.sh','maker.out','maker.err','taker.out','taker.err','addinvoice.out','addinvoice.err','taker_invoice.txt','order_id.txt','shape.txt','invoice_shape.txt','handshake_result.txt','secret_gate.txt','evidence','safe-artifact','stagea_hold','stagea_payout','stagea_vars','stagea_payment_state','stagea_tstart','stagea_pay_pid','stagea_dm.sh','stagea_dm.out','stagea_dm.err','alice_pay.out','alice_pay.err')
+          try:
+              root.lstat(); left=[]
+              for name in names:
+                  try: (root/name).lstat()
+                  except FileNotFoundError: continue
+                  left.append(name)
+          except OSError as exc:
+              print('runner-temp inspection failed: '+str(exc)); raise SystemExit(2)
+          if left: print('runner-temp resources remain: '+','.join(left)); raise SystemExit(1)
+          print('runner-temp absence confirmed')
+          PY
+          then echo 'runner-temp absence confirmed'; else rc=$?; echo "runner-temp inspection/absence failed rc=$rc"; cleanup_failed=1; fi
+          if [ "$cleanup_failed" = 0 ]; then echo 'CLEANUP VERIFIED'; else echo 'CLEANUP NOT VERIFIED'; exit 1; fi
+      - name: Verdict
+        if: always()
+        env:
+          GATE_RESULT: ${{ steps.stagea_gate.outputs.gate }}
+          UPLOAD_OUTCOME: ${{ steps.stagea_upload.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.stagea_cleanup.outcome }}
+        run: |
+          set +x
+          gate=${GATE_RESULT:-missing}
+          printf 'PHASE5A_GATE=%s UPLOAD=%s CLEANUP=%s\n' "$gate" "${UPLOAD_OUTCOME:-missing}" "${CLEANUP_OUTCOME:-missing}"
+          if [ "$gate" != pass ]; then echo 'FAIL: Phase 5A gate'; exit 1; fi
+          if [ "${UPLOAD_OUTCOME:-}" != success ]; then echo 'FAIL: artifact upload'; exit 1; fi
+          if [ "${CLEANUP_OUTCOME:-}" != success ]; then echo 'FAIL: cleanup'; exit 1; fi
+          echo 'SUCCESS: Phase 5A hold invoice ACCEPTED, exactly one seller IN_FLIGHT payment, BuyerTookOrder and HoldInvoicePaymentAccepted Active, buyer payout OPEN; no settlement; sanitized manifest uploaded'
