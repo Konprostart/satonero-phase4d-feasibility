@@ -713,27 +713,58 @@ jobs:
           d=/tmp/stagea_dm; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
           check() {
             recipient="$1"; keyfile="$2"; action="$3"
+            deadline=$(( $(date +%s) + 60 ))
             n=0
+            incomplete=0
             attempt=0
             while [ "$attempt" -lt 30 ]; do
               attempt=$((attempt+1))
-              ids=$(timeout 40 nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null | sort -u)
+              rem=$((deadline - $(date +%s)))
+              [ "$rem" -gt 0 ] || break
               n=0
+              qfile="$d/$action.ids"
+              timeout "$rem" nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null > "$qfile" 2>/dev/null
+              qrc=$?
+              if [ "$qrc" -ne 0 ]; then incomplete=1; break; fi
+              ids=$(sort -u "$qfile")
               for id in $ids; do
-                timeout 40 nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > "$d/$id.json" 2>/dev/null || continue
-                nak verify < "$d/$id.json" >/dev/null 2>&1 || continue
-                ct=$(timeout 40 nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null) || continue
+                rem=$((deadline - $(date +%s)))
+                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
+                timeout "$rem" nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > "$d/$id.json" 2>/dev/null
+                rc=$?
+                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
+                rem=$((deadline - $(date +%s)))
+                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
+                timeout "$rem" nak verify < "$d/$id.json" >/dev/null 2>&1
+                rc=$?
+                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
+                rem=$((deadline - $(date +%s)))
+                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
+                ct=$(timeout "$rem" nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
+                rc=$?
+                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
+                rem=$((deadline - $(date +%s)))
+                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
                 export NOSTR_SECRET_KEY="$(cat "$keyfile")"
-                timeout 40 nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null > "$d/$id.plain" 2>/dev/null || { unset NOSTR_SECRET_KEY; continue; }
+                timeout "$rem" nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null > "$d/$id.plain" 2>/dev/null
+                rc=$?
                 unset NOSTR_SECRET_KEY
-                jq -e --arg a "$action" --arg o "$ORDER" '.[0].order.action==$a and .[0].order.id==$o and .[0].order.status=="active"' "$d/$id.plain" >/dev/null 2>&1 || continue
+                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
+                rem=$((deadline - $(date +%s)))
+                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
+                timeout "$rem" jq -e --arg a "$action" --arg o "$ORDER" '.[0].order.action==$a and .[0].order.id==$o and .[0].order.status=="active"' "$d/$id.plain" >/dev/null 2>&1
+                rc=$?
+                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
                 n=$((n+1))
               done
               [ "$n" -ge 1 ] && break
-              [ "$attempt" -lt 30 ] && sleep 2
+              rem=$((deadline - $(date +%s)))
+              if [ "$rem" -gt 2 ]; then sleep 2; elif [ "$rem" -gt 0 ]; then sleep "$rem"; fi
             done
-            printf '%s=%s\n' "$action" "$n"
-            [ "$n" = 1 ]
+            printf '%s=%s' "$action" "$n"
+            if [ "$incomplete" = 1 ]; then printf ' incomplete=1'; fi
+            printf '\n'
+            [ "$n" = 1 ] && [ "$incomplete" = 0 ]
           }
           check "$MAKER" /tmp/maker.hex buyer-took-order || exit 1
           check "$TAKER" /tmp/taker.hex hold-invoice-payment-accepted || exit 1
@@ -742,7 +773,7 @@ jobs:
           docker cp "$RUNNER_TEMP/stagea_dm.sh" "$cid:/tmp/stagea_dm.sh"
           docker exec "$cid" sh -c 'rm -rf /tmp/stagea_dm'
           dm_rc=0
-          timeout 60 docker compose exec -T nostr_relay sh /tmp/stagea_dm.sh "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err" || dm_rc=$?
+          timeout 150 docker compose exec -T nostr_relay sh /tmp/stagea_dm.sh "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err" || dm_rc=$?
           cat "$RUNNER_TEMP/stagea_dm.out"
           if [ "$dm_rc" -ne 0 ]; then
             echo "DM helper failed rc=$dm_rc" >&2
