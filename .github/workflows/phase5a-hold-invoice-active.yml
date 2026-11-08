@@ -732,11 +732,15 @@ jobs:
                 case "$qrc" in
                   124) qlabel=query_timeout ;;
                   *) case "$qerr_line" in
-                       *[Cc]onnect*|*[Nn]o*route*|*[Uu]nable*to*|*[Rr]efused*) qlabel=relay_connection ;;
+                       *[Ii]nvalid*jq*|*jq*expression*|*jq*filter*failed*) qlabel=invalid_jq ;;
+                       *[Ii]nvalid*--tag*|*[Ii]nvalid*tag*) qlabel=invalid_tag ;;
+                       *[Ii]nvalid*relay*|*[Ii]nvalid*url*) qlabel=invalid_relay ;;
                        *[Tt]imeout*|*timed*out*) qlabel=query_timeout ;;
-                       *[Uu]sage*|*[Ii]nvalid*|*[Uu]nknown*) qlabel=cli_error ;;
+                       *[Uu]nknown*|*unrecognized*|*not*defined*) qlabel=unknown_cli ;;
+                       *[Uu]sage*|*[Hh]elp*) qlabel=usage ;;
+                       *[Cc]onnect*|*[Nn]o*route*|*[Uu]nable*to*|*[Rr]efused*) qlabel=relay_connection ;;
                        "") qlabel=empty_stderr ;;
-                       *) qlabel=other ;;
+                       *) qlabel=other_cli ;;
                      esac ;;
                 esac
                 printf 'query_rc=%s\n' "$qrc"
