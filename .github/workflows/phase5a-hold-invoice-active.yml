@@ -728,6 +728,10 @@ jobs:
               qrc=$?
               if [ "$qrc" -ne 0 ]; then
                 incomplete=1
+                if [ -f "$qfile" ]; then qout_bytes=$(wc -c < "$qfile" 2>/dev/null || true); else qout_bytes=-1; fi
+                case "$qout_bytes" in ''|*[!0-9]*) qout_bytes=-1 ;; esac
+                if [ -f "$qerr" ]; then qerr_bytes=$(wc -c < "$qerr" 2>/dev/null || true); else qerr_bytes=-1; fi
+                case "$qerr_bytes" in ''|*[!0-9]*) qerr_bytes=-1 ;; esac
                 qerr_line=$(head -n 1 "$qerr" 2>/dev/null | cut -c1-256)
                 case "$qrc" in
                   124) qlabel=query_timeout ;;
@@ -745,6 +749,8 @@ jobs:
                 esac
                 printf 'query_rc=%s\n' "$qrc"
                 printf 'query_error=%s\n' "$qlabel"
+                printf 'query_output_bytes=%s\n' "$qout_bytes"
+                printf 'query_stderr_bytes=%s\n' "$qerr_bytes"
                 break
               fi
               ids=$(sort -u "$qfile")
