@@ -807,6 +807,22 @@ jobs:
                   raise SystemExit(2)
           hex64=re.compile(r'[0-9a-f]{64}')
           hex128=re.compile(r'[0-9a-f]{128}')
+          bolt11=re.compile(r'^lnbcrt([1-9][0-9]*[munp])?1[02-9ac-hj-np-z]{50,2000}$')
+          shape=read(os.path.join(os.path.dirname(E),'invoice_shape.txt'))
+          if 'shape=invoice_handshake_ok' not in shape.splitlines():
+              raise SystemExit(2)
+          invoices=set()
+          for invname in ('taker_add_invoice_request.plain','maker_pay_invoice14.plain'):
+              try:
+                  msg=json.loads(read(os.path.join(E,invname)))
+                  pr=msg[0]['order']['payload']['payment_request']
+              except SystemExit:
+                  raise
+              except Exception:
+                  raise SystemExit(2)
+              if not isinstance(pr,list) or len(pr)!=3 or not isinstance(pr[1],str) or not bolt11.fullmatch(pr[1]):
+                  raise SystemExit(2)
+              invoices.add(pr[1])
           for dirpath, dirnames, filenames in os.walk(E, followlinks=True):
               for name in sorted(filenames):
                   p=os.path.join(dirpath,name)
@@ -828,7 +844,12 @@ jobs:
                           stripped=dict(ev); stripped.pop('content',None)
                           violations += scan(json.dumps(stripped,sort_keys=True))
                           continue
-                  violations += scan(text)
+                  scan_text=text
+                  if dirpath==E and name in ('taker_add_invoice_request.plain','maker_pay_invoice14.plain'):
+                      for inv in invoices:
+                          if inv in scan_text:
+                              scan_text=scan_text.replace(inv,'')
+                  violations += scan(scan_text)
           for p in outs:
               if not os.path.isfile(p):
                   raise SystemExit(2)
