@@ -826,13 +826,39 @@ jobs:
             echo "secret_pattern_files diag: category=raw file=$rel" >> "$OUT"
           done
           n_age=$(python3 - "$E" "$OUT" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" <<'PY'
-          import json, os, re, sys
+          import base64, json, os, re, sys
           E=sys.argv[1]; OUT=sys.argv[2]; outs=sys.argv[3:]
           age=re.compile(r'AgE[A-Za-z0-9+/]{40,}', re.I)
           b64=re.compile(r'[A-Za-z0-9+/]+={0,2}')
           violations=0
           def scan(text):
               return 1 if age.search(text) else 0
+          MAX_RAW=4294967367
+          MAX_CT=MAX_RAW-65
+          MAX_B64=(MAX_RAW+2)//3*4
+          def possible_padded(p):
+              if p in (32,64,96,128): return True
+              if p < 160 or p % 32 != 0: return False
+              for k in (5,6,7,8):
+                  if p % k == 0:
+                      chunk=p//k
+                      if chunk >= 32 and (chunk & (chunk-1)) == 0:
+                          return True
+              return False
+          def valid_nip44_ct(ct):
+              if ct < 34 or ct > MAX_CT: return False
+              if ct - 2 <= 65536 and possible_padded(ct - 2): return True
+              if ct - 6 >= 65536 and possible_padded(ct - 6): return True
+              return False
+          def valid_nip44_v2(content):
+              if not isinstance(content,str) or not b64.fullmatch(content) or len(content) < 132 or len(content) > MAX_B64: return False
+              try:
+                  raw=base64.b64decode(content, validate=True)
+              except Exception:
+                  return False
+              if base64.b64encode(raw).decode('ascii') != content: return False
+              if len(raw) < 99 or len(raw) > MAX_RAW or raw[0] != 2: return False
+              return valid_nip44_ct(len(raw)-65)
           def relpath(p):
               p=os.path.normpath(p); root=os.path.normpath(E)
               if p==root: return 'evidence'
@@ -886,8 +912,7 @@ jobs:
                           diag('fail_closed_malformed_json',p); raise SystemExit(2)
                       if isinstance(ev,dict) and ev.get('kind')==14:
                           content=ev.get('content')
-                          if (not isinstance(content,str) or not content.startswith('Ag')
-                              or not b64.fullmatch(content)
+                          if (not valid_nip44_v2(content)
                               or not isinstance(ev.get('id'),str) or not hex64.fullmatch(ev['id'])
                               or not isinstance(ev.get('pubkey'),str) or not hex64.fullmatch(ev['pubkey'])
                               or not isinstance(ev.get('sig'),str) or not hex128.fullmatch(ev['sig'])):
