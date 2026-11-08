@@ -732,21 +732,23 @@ jobs:
                 case "$qout_bytes" in ''|*[!0-9]*) qout_bytes=-1 ;; esac
                 if [ -f "$qerr" ]; then qerr_bytes=$(wc -c < "$qerr" 2>/dev/null || true); else qerr_bytes=-1; fi
                 case "$qerr_bytes" in ''|*[!0-9]*) qerr_bytes=-1 ;; esac
-                qerr_line=$(head -n 1 "$qerr" 2>/dev/null | cut -c1-256)
-                case "$qrc" in
-                  124) qlabel=query_timeout ;;
-                  *) case "$qerr_line" in
-                       *[Ii]nvalid*jq*|*jq*expression*|*jq*filter*failed*) qlabel=invalid_jq ;;
-                       *[Ii]nvalid*--tag*|*[Ii]nvalid*tag*) qlabel=invalid_tag ;;
-                       *[Ii]nvalid*relay*|*[Ii]nvalid*url*) qlabel=invalid_relay ;;
-                       *[Tt]imeout*|*timed*out*) qlabel=query_timeout ;;
-                       *[Uu]nknown*|*unrecognized*|*not*defined*) qlabel=unknown_cli ;;
-                       *[Uu]sage*|*[Hh]elp*) qlabel=usage ;;
-                       *[Cc]onnect*|*[Nn]o*route*|*[Uu]nable*to*|*[Rr]efused*) qlabel=relay_connection ;;
-                       "") qlabel=empty_stderr ;;
-                       *) qlabel=other_cli ;;
-                     esac ;;
-                esac
+                if [ "$qrc" = 124 ]; then
+                  qlabel=query_timeout
+                elif grep -Fq 'invalid jq expression' "$qerr" 2>/dev/null || grep -Fq 'failed to compile jq expression' "$qerr" 2>/dev/null; then
+                  qlabel=invalid_jq
+                elif grep -Fq 'jq filter failed' "$qerr" 2>/dev/null; then
+                  qlabel=jq_runtime
+                elif grep -Fq 'invalid --tag' "$qerr" 2>/dev/null; then
+                  qlabel=invalid_tag
+                elif grep -Fq 'invalid relay URL' "$qerr" 2>/dev/null; then
+                  qlabel=invalid_relay
+                elif grep -Fq 'failed to connect to any of the given relays.' "$qerr" 2>/dev/null; then
+                  qlabel=relay_all_failed
+                elif grep -Fq 'CLOSED: ' "$qerr" 2>/dev/null; then
+                  qlabel=relay_closed
+                else
+                  qlabel=other_cli
+                fi
                 printf 'query_rc=%s\n' "$qrc"
                 printf 'query_error=%s\n' "$qlabel"
                 printf 'query_output_bytes=%s\n' "$qout_bytes"
