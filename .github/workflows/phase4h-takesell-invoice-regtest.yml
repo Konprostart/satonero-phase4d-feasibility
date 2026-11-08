@@ -85,6 +85,28 @@ jobs:
           open(p, "w", encoding="utf-8").write(text.replace(old, new))
           PY
           test "$(sha256sum "$f" | cut -d' ' -f1)" = "65a3d14cc76245ec6dca5b1b939e934cbd509fe8788c1935d940def9be606b0c"
+      - name: Pin geth-hdwallet in bitcoin image
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          f=docker/bitcoin/Dockerfile
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "f093ea3eaab491e62e8f4b87ffff8d066f0a980d7b3424277f377da87324cc45"
+          python3 - <<'PY'
+          p = "docker/bitcoin/Dockerfile"
+          lines = open(p, encoding="utf-8").read().split("\n")
+          slash = chr(92)
+          i = [n for n, line in enumerate(lines) if line.startswith("RUN BIN_URL=$(curl -s https://api.github.com/repos/miguelmota/go-ethereum-hdwallet/releases/")]
+          assert len(i) == 1, i
+          i = i[0]
+          assert lines[i + 1] == "  && TMP_DIR=$(mktemp -d) " + slash, lines[i + 1]
+          assert lines[i + 2] == "  && cd $TMP_DIR " + slash, lines[i + 2]
+          assert lines[i + 3] == "  && curl -SLO $BIN_URL " + slash, lines[i + 3]
+          lines[i] = "RUN BIN_URL=https://github.com/miguelmota/go-ethereum-hdwallet/releases/download/v0.1.3/go-ethereum-hdwallet_0.1.3_linux_amd64.tar.gz " + slash
+          lines[i + 3] = "  && curl -fSLO $BIN_URL " + slash
+          lines.insert(i + 4, '  && echo "a53a72d29ac0d57c36a2ab46010a6a52c6fa1bcf21345abc649f1a2161302d48  go-ethereum-hdwallet_0.1.3_linux_amd64.tar.gz" | sha256sum -c - ' + slash)
+          open(p, "w", encoding="utf-8").write("\n".join(lines))
+          PY
+          test "$(sha256sum "$f" | cut -d' ' -f1)" = "71909d683d92ff675f5c2151e90c4f30f365a1a269463c7332bbe0b2577ac0d5"
       - name: Build Satonero daemon image
         working-directory: satonero
         timeout-minutes: 40
