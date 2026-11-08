@@ -574,8 +574,7 @@ jobs:
               bob_lnd) gi=$(ln_bob getinfo);;
               mostro_lnd) gi=$(ln_mostro getinfo);;
             esac
-            printf '%s' "$gi" | jq -e '.chains | index("bitcoin") != null' >/dev/null || { echo "FAIL: $svc not bitcoin"; exit 1; }
-            printf '%s' "$gi" | jq -e '.networks | index("regtest") != null' >/dev/null || { echo "FAIL: $svc not regtest"; exit 1; }
+            printf '%s' "$gi" | jq -e '.chains | any(.[]; .chain == "bitcoin" and .network == "regtest")' >/dev/null || { echo "FAIL: $svc not bitcoin/regtest"; exit 1; }
             [ "$(printf '%s' "$gi" | jq -r .synced_to_chain)" = true ] || { echo "FAIL: $svc not synced"; exit 1; }
           done
           [ "$(ln_alice listchannels | jq '.channels|length')" = 0 ] || { echo 'FAIL: seller already has channel'; exit 1; }
