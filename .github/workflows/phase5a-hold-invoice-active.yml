@@ -744,7 +744,13 @@ jobs:
                   qlabel=invalid_relay
                 elif grep -Fq 'failed to connect to any of the given relays.' "$qerr" 2>/dev/null; then
                   qlabel=relay_all_failed
-                elif grep -Fq 'CLOSED: ' "$qerr" 2>/dev/null; then
+                elif grep -Fq 'failed to connect: ' "$qerr" 2>/dev/null; then
+                  qlabel=relay_connect_failed
+                elif grep -Fq 'error opening websocket' "$qerr" 2>/dev/null; then
+                  qlabel=websocket_open_failed
+                elif grep -Fq 'connection took too long' "$qerr" 2>/dev/null; then
+                  qlabel=relay_timeout
+                elif grep -Fq 'CLOSED: ' "$qerr" 2>/dev/null || grep -Fq 'CLOSED received: ' "$qerr" 2>/dev/null; then
                   qlabel=relay_closed
                 else
                   qlabel=other_cli
