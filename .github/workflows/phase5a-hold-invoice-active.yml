@@ -752,6 +752,10 @@ jobs:
                   qlabel=relay_timeout
                 elif grep -Fq 'CLOSED: ' "$qerr" 2>/dev/null || grep -Fq 'CLOSED received: ' "$qerr" 2>/dev/null; then
                   qlabel=relay_closed
+                elif grep -Fq 'flag provided but not defined: -' "$qerr" 2>/dev/null; then
+                  qlabel=unknown_flag
+                elif grep -Fq 'Incorrect Usage' "$qerr" 2>/dev/null; then
+                  qlabel=usage_error
                 else
                   qlabel=other_cli
                 fi
