@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Konprostart/Satonero
-          ref: 2534f8b0f05ade36007445511e02747f4468109a
+          ref: a0f037a51a2b59da646d8a916042695d1a86903e
           path: satonero
           persist-credentials: false
           fetch-depth: 1
@@ -707,136 +707,24 @@ jobs:
             printf 'BUYER_PAYMENT_COUNT=%s\n' "$BUYER_PAYMENTS"
           } > "$RUNNER_TEMP/stagea_payment_state"
           cat > "$RUNNER_TEMP/stagea_dm.sh" <<'SH'
-          #!/bin/sh
-          set -u
-          DAEMON="$1"; MAKER="$2"; TAKER="$3"; ORDER="$4"; TSTART="$5"
-          d=/tmp/stagea_dm; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
-          check() {
-            recipient="$1"; keyfile="$2"; action="$3"
-            deadline=$(( $(date +%s) + 60 ))
-            n=0
-            incomplete=0
-            attempt=0
-            while [ "$attempt" -lt 30 ]; do
-              attempt=$((attempt+1))
-              rem=$((deadline - $(date +%s)))
-              [ "$rem" -gt 0 ] || break
-              n=0
-              qfile="$d/$action.ids"
-              qerr="$d/$action.err"
-              timeout "$rem" nak req -k 14 -a "$DAEMON" -t p="$recipient" --limit 50 --jq "select(.kind==14 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"p\")]==[[\"p\",\"$recipient\"]]) and .created_at>=$TSTART) | .id" --jq-raw ws://localhost:8080 < /dev/null > "$qfile" 2> "$qerr"
-              qrc=$?
-              if [ "$qrc" -ne 0 ]; then
-                incomplete=1
-                if [ -f "$qfile" ]; then qout_bytes=$(wc -c < "$qfile" 2>/dev/null || true); else qout_bytes=-1; fi
-                case "$qout_bytes" in ''|*[!0-9]*) qout_bytes=-1 ;; esac
-                if [ -f "$qerr" ]; then qerr_bytes=$(wc -c < "$qerr" 2>/dev/null || true); else qerr_bytes=-1; fi
-                case "$qerr_bytes" in ''|*[!0-9]*) qerr_bytes=-1 ;; esac
-                if [ "$qrc" = 124 ]; then
-                  qlabel=query_timeout
-                elif grep -Fq 'invalid jq expression' "$qerr" 2>/dev/null || grep -Fq 'failed to compile jq expression' "$qerr" 2>/dev/null; then
-                  qlabel=invalid_jq
-                elif grep -Fq 'jq filter failed' "$qerr" 2>/dev/null; then
-                  qlabel=jq_runtime
-                elif grep -Fq 'invalid --tag' "$qerr" 2>/dev/null; then
-                  qlabel=invalid_tag
-                elif grep -Fq 'invalid relay URL' "$qerr" 2>/dev/null; then
-                  qlabel=invalid_relay
-                elif grep -Fq 'failed to connect to any of the given relays.' "$qerr" 2>/dev/null; then
-                  qlabel=relay_all_failed
-                elif grep -Fq 'failed to connect: ' "$qerr" 2>/dev/null; then
-                  qlabel=relay_connect_failed
-                elif grep -Fq 'error opening websocket' "$qerr" 2>/dev/null; then
-                  qlabel=websocket_open_failed
-                elif grep -Fq 'connection took too long' "$qerr" 2>/dev/null; then
-                  qlabel=relay_timeout
-                elif grep -Fq 'CLOSED: ' "$qerr" 2>/dev/null || grep -Fq 'CLOSED received: ' "$qerr" 2>/dev/null; then
-                  qlabel=relay_closed
-                elif grep -Fq 'flag provided but not defined: -' "$qerr" 2>/dev/null; then
-                  qlabel=unknown_flag
-                elif grep -Fq 'Incorrect Usage' "$qerr" 2>/dev/null; then
-                  qlabel=usage_error
-                else
-                  qlabel=other_cli
-                fi
-                printf 'query_rc=%s\n' "$qrc"
-                printf 'query_error=%s\n' "$qlabel"
-                printf 'query_output_bytes=%s\n' "$qout_bytes"
-                printf 'query_stderr_bytes=%s\n' "$qerr_bytes"
-                break
-              fi
-              ids=$(sort -u "$qfile")
-              for id in $ids; do
-                rem=$((deadline - $(date +%s)))
-                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
-                timeout "$rem" nak req --id "$id" --limit 1 ws://localhost:8080 < /dev/null > "$d/$id.json" 2>/dev/null
-                rc=$?
-                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
-                rem=$((deadline - $(date +%s)))
-                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
-                timeout "$rem" nak verify < "$d/$id.json" >/dev/null 2>&1
-                rc=$?
-                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
-                rem=$((deadline - $(date +%s)))
-                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
-                ct=$(timeout "$rem" nak req --id "$id" --limit 1 --jq '.content' --jq-raw ws://localhost:8080 < /dev/null 2>/dev/null)
-                rc=$?
-                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
-                rem=$((deadline - $(date +%s)))
-                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
-                export NOSTR_SECRET_KEY="$(cat "$keyfile")"
-                timeout "$rem" nak decrypt --sender-pubkey "$DAEMON" "$ct" < /dev/null > "$d/$id.plain" 2>/dev/null
-                rc=$?
-                unset NOSTR_SECRET_KEY
-                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
-                rem=$((deadline - $(date +%s)))
-                [ "$rem" -gt 0 ] || { incomplete=1; break 2; }
-                timeout "$rem" jq -e --arg a "$action" --arg o "$ORDER" '.[0].order.action==$a and .[0].order.id==$o and .[0].order.status=="active"' "$d/$id.plain" >/dev/null 2>&1
-                rc=$?
-                if [ "$rc" -ne 0 ]; then [ "$rc" = 124 ] && { incomplete=1; break 2; }; continue; fi
-                n=$((n+1))
-              done
-              [ "$n" -ge 1 ] && break
-              rem=$((deadline - $(date +%s)))
-              if [ "$rem" -gt 2 ]; then sleep 2; elif [ "$rem" -gt 0 ]; then sleep "$rem"; fi
-            done
-            printf '%s=%s' "$action" "$n"
-            if [ "$incomplete" = 1 ]; then printf ' incomplete=1'; fi
-            printf '\n'
-            [ "$n" = 1 ] && [ "$incomplete" = 0 ]
+          #!/bin/bash
+          set -euo pipefail
+          DAEMON="$1"; MAKER="$2"; TAKER="$3"; ORDER="$4"; TSTART="$5"; TEMP="$6"
+          run_diag() {
+            keyfile="$1"; recipient="$2"; action="$3"
+            docker run --rm --network mostro-regtest_default --user "$(id -u):$(id -g)" \
+              --mount "type=bind,src=$TEMP/$keyfile,dst=/run/recipient.hex,readonly" \
+              --entrypoint /usr/local/bin/stagea_dm_diag docker-mostro:latest \
+              --relay ws://nostr_relay:8080 --daemon "$DAEMON" \
+              --recipient-secret-file /run/recipient.hex --order-id "$ORDER" \
+              --since "$TSTART" --expect "$action"
           }
-          nak_path=$(command -v nak 2>/dev/null || true)
-          nak_ok=1
-          if [ "$nak_path" = "/usr/local/bin/nak" ]; then
-            printf 'NAK_PATH=PASS\n'
-          else
-            printf 'NAK_PATH=FAIL\n'
-            nak_ok=0
-          fi
-          printf 'NAK_PATH_VALUE=%s\n' "$nak_path"
-          nak_version=$(nak --version 2>/dev/null)
-          nak_version_rc=$?
-          nak_version=$(printf '%s\n' "$nak_version" | head -n 1)
-          if [ "$nak_version_rc" -eq 0 ] && [ -n "$nak_version" ]; then
-            printf 'NAK_VERSION_CMD=PASS\n'
-          else
-            printf 'NAK_VERSION_CMD=FAIL\n'
-            nak_ok=0
-          fi
-          printf 'NAK_VERSION=%s\n' "$nak_version"
-          case "$nak_version" in
-            *v0.22.2*) printf 'NAK_VERSION_MATCH=PASS\n' ;;
-            *) printf 'NAK_VERSION_MATCH=FAIL\n'; nak_ok=0 ;;
-          esac
-          [ "$nak_ok" = 1 ] || exit 1
-          check "$MAKER" /tmp/maker.hex buyer-took-order || exit 1
-          check "$TAKER" /tmp/taker.hex hold-invoice-payment-accepted || exit 1
+          run_diag maker.hex "$MAKER" buyer-took-order
+          run_diag taker.hex "$TAKER" hold-invoice-payment-accepted
           SH
-          cid=$(docker compose ps -q nostr_relay); test -n "$cid"
-          docker cp "$RUNNER_TEMP/stagea_dm.sh" "$cid:/tmp/stagea_dm.sh"
-          docker exec "$cid" sh -c 'rm -rf /tmp/stagea_dm'
+          chmod 700 "$RUNNER_TEMP/stagea_dm.sh"
           dm_rc=0
-          timeout 150 docker compose exec -T nostr_relay sh /tmp/stagea_dm.sh "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err" || dm_rc=$?
+          timeout 150 bash "$RUNNER_TEMP/stagea_dm.sh" "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" "$RUNNER_TEMP" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err" || dm_rc=$?
           cat "$RUNNER_TEMP/stagea_dm.out"
           if [ "$dm_rc" -ne 0 ]; then
             echo "DM helper failed rc=$dm_rc" >&2
