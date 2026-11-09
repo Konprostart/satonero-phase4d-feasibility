@@ -801,6 +801,30 @@ jobs:
             printf '\n'
             [ "$n" = 1 ] && [ "$incomplete" = 0 ]
           }
+          nak_path=$(command -v nak 2>/dev/null || true)
+          nak_ok=1
+          if [ "$nak_path" = "/usr/local/bin/nak" ]; then
+            printf 'NAK_PATH=PASS\n'
+          else
+            printf 'NAK_PATH=FAIL\n'
+            nak_ok=0
+          fi
+          printf 'NAK_PATH_VALUE=%s\n' "$nak_path"
+          nak_version=$(nak --version 2>/dev/null)
+          nak_version_rc=$?
+          nak_version=$(printf '%s\n' "$nak_version" | head -n 1)
+          if [ "$nak_version_rc" -eq 0 ] && [ -n "$nak_version" ]; then
+            printf 'NAK_VERSION_CMD=PASS\n'
+          else
+            printf 'NAK_VERSION_CMD=FAIL\n'
+            nak_ok=0
+          fi
+          printf 'NAK_VERSION=%s\n' "$nak_version"
+          case "$nak_version" in
+            *v0.22.2*) printf 'NAK_VERSION_MATCH=PASS\n' ;;
+            *) printf 'NAK_VERSION_MATCH=FAIL\n'; nak_ok=0 ;;
+          esac
+          [ "$nak_ok" = 1 ] || exit 1
           check "$MAKER" /tmp/maker.hex buyer-took-order || exit 1
           check "$TAKER" /tmp/taker.hex hold-invoice-payment-accepted || exit 1
           SH
