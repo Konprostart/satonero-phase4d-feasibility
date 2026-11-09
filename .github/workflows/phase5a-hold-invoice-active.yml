@@ -44,7 +44,7 @@ jobs:
       - name: Verify pinned SHAs and clean Satonero tree
         run: |
           set -euo pipefail
-          test "$(git -C satonero rev-parse HEAD)" = "2534f8b0f05ade36007445511e02747f4468109a"
+          test "$(git -C satonero rev-parse HEAD)" = "a0f037a51a2b59da646d8a916042695d1a86903e"
           test "$(git -C mostro-regtest rev-parse HEAD)" = "c6adbdaaaf0a2152a0728dbce6adf11945f547bd"
           test -z "$(git -C satonero status --porcelain --untracked-files=all)"
       - name: Pin nak and apply runner-only relay healthcheck fix
@@ -803,7 +803,7 @@ jobs:
           manifest={
             'schema':'phase5a-hold-invoice-active-v1',
             'run_id':__import__('os').environ.get('GITHUB_RUN_ID',''),
-            'source':{'satonero':'2534f8b0f05ade36007445511e02747f4468109a','regtest':'c6adbdaaaf0a2152a0728dbce6adf11945f547bd','nak':'v0.22.2'},
+            'source':{'satonero':'a0f037a51a2b59da646d8a916042695d1a86903e','regtest':'c6adbdaaaf0a2152a0728dbce6adf11945f547bd','nak':'v0.22.2'},
             'order_id':order,
             'roles':{'seller':'alice_lnd','buyer':'bob_lnd','daemon':'mostro_lnd'},
             'lnd_identities':{'seller':seller,'buyer':buyer,'daemon':daemon},
