@@ -35,7 +35,7 @@ jobs:
     env:
       DAEMON_SHA: 378a5c60833adee143861c5c8e9c5eb0544ec0a7
       REGTEST_SHA: c6adbdaaaf0a2152a0728dbce6adf11945f547bd
-      MOBILE_SHA: abafbe97ce5cb6eac03e48654c62367ee505aa8d
+      MOBILE_SHA: 22ec7cb0d0cdfd7f492ca707f370861b13332658
     steps:
       - name: Pre-flight and disk gate
         run: |
