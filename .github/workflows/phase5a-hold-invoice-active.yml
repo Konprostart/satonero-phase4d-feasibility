@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Konprostart/Satonero
-          ref: a0f037a51a2b59da646d8a916042695d1a86903e
+          ref: fb30b78ec3338bd4b0e0f4803985b410b57b933a
           path: satonero
           persist-credentials: false
           fetch-depth: 1
@@ -44,7 +44,7 @@ jobs:
       - name: Verify pinned SHAs and clean Satonero tree
         run: |
           set -euo pipefail
-          test "$(git -C satonero rev-parse HEAD)" = "a0f037a51a2b59da646d8a916042695d1a86903e"
+          test "$(git -C satonero rev-parse HEAD)" = "fb30b78ec3338bd4b0e0f4803985b410b57b933a"
           test "$(git -C mostro-regtest rev-parse HEAD)" = "c6adbdaaaf0a2152a0728dbce6adf11945f547bd"
           test -z "$(git -C satonero status --porcelain --untracked-files=all)"
       - name: Pin nak and apply runner-only relay healthcheck fix
