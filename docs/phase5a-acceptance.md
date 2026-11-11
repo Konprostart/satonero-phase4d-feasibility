@@ -30,7 +30,7 @@ unreviewed pin changes do not count.
 | 43018709176 | `99eff96` | 2026-11-11 12:15Z | FAIL | Wrong author key in the helper (`$DAEMON_ID`, an LND identity, instead of the daemon Nostr pubkey): 0 DMs after 120 s of polling. Root cause identified. |
 | 43024050979 | `a657e9c` | 2026-11-11 12:52Z | **PASS** | 29/29 steps; both Active DMs on attempt 1; manifest ok; `CLEANUP VERIFIED`. |
 | 43030138039 | `a657e9c` | 2026-11-11 13:33Z | **PASS** | Repeatability on the unchanged harness: 29/29 steps; both DMs attempt 1 at 1 s; `CLEANUP VERIFIED`. |
-| RUN3_ID | `5b9a066` | RUN3_DATE | RUN3_RESULT | Probe removed (`4c09157`); daemon pin moved to `fb30b78`, so the image is built through the scoped `diag` target. |
+| 43035353939 | `5b9a066` | 2026-11-11 14:06Z | **PASS** | Probe removed (`4c09157`, zero `order38383_active` output in the log); daemon pin `fb30b78`, image built through the scoped `diag` target (`[diag 1/1] COPY ... stagea_dm_diag`), daemon started from the same image. 29/29 steps, `CLEANUP VERIFIED`. |
 
 ## Recorded latency
 
@@ -45,6 +45,11 @@ Run 43030138039:
 - `hold-invoice-payment-accepted`: attempt 1, elapsed 1 s.
 - `dm_poll_elapsed_s=60`: the helper ran out the second 60 s window before
   returning; the DMs themselves were found on the first poll.
+
+Run 43035353939:
+- `buyer-took-order`: attempt 1, `< 1 s`.
+- `hold-invoice-payment-accepted`: attempt 1, `< 1 s`.
+- `dm_poll_elapsed_s=0` (both found on the first poll).
 
 ## What Phase 5A does not cover
 
