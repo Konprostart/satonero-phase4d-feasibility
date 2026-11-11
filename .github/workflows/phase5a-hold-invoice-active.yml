@@ -595,6 +595,24 @@ jobs:
           [ "$PAYOUT_DEST" = "$BUYER_ID" ] || { echo 'FAIL: payout destination is not bob_lnd'; exit 1; }
           [ "$PAYOUT_AMT" -gt 0 ] || { echo 'FAIL: invalid payout amount'; exit 1; }
           [ "$(ln_bob lookupinvoice "$PAYOUT_HASH" | jq -r .state)" = OPEN ] || { echo 'FAIL: payout not OPEN'; exit 1; }
+          # The DM helper must use the daemon's Nostr identity, not its LND
+          # identity. Assert that the key the harness will pass to it is the
+          # author of the daemon's kind-38385 info event, so a wrong key can
+          # never again silently produce zero DM matches. Read-only; the event
+          # is republished at startup and every publish_mostro_info_interval.
+          NOSTR_PUB=$(cat "$RUNNER_TEMP/daemon.pub")
+          [ "${#NOSTR_PUB}" = 64 ] || { echo 'FAIL: daemon.pub is not a 64-hex Nostr key'; exit 1; }
+          info_ok=0
+          for i in $(seq 1 15); do
+            n=$(timeout 20 docker run --rm --network mostro-regtest_default \
+                  --entrypoint nak mostro-regtest-nostr_relay \
+                  req -k 38385 -a "$NOSTR_PUB" --limit 5 --jq '.id' --jq-raw \
+                  ws://nostr_relay:8080 2>/dev/null | grep -Ec '^[0-9a-f]{64}$' || true)
+            if [ "${n:-0}" -ge 1 ]; then info_ok=1; break; fi
+            sleep 2
+          done
+          [ "$info_ok" = 1 ] || { echo "FAIL: no kind 38385 info event authored by daemon.pub=$NOSTR_PUB"; exit 1; }
+          echo "daemon identity ok: kind 38385 authored by daemon.pub"
           {
             printf 'ORDER=%s\n' "$ORDER"
             printf 'EXPECTED=%s\n' "$EXPECTED"
@@ -809,7 +827,7 @@ jobs:
           chmod 700 "$RUNNER_TEMP/stagea_dm.sh"
           dm_rc=0
           dm_start=$(date +%s)
-          timeout 180 bash "$RUNNER_TEMP/stagea_dm.sh" "$DAEMON_ID" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" "$RUNNER_TEMP" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err" || dm_rc=$?
+          timeout 180 bash "$RUNNER_TEMP/stagea_dm.sh" "$(cat "$RUNNER_TEMP/daemon.pub")" "$(cat "$RUNNER_TEMP/maker.pub")" "$(cat "$RUNNER_TEMP/taker.pub")" "$ORDER" "$TSTART" "$RUNNER_TEMP" > "$RUNNER_TEMP/stagea_dm.out" 2> "$RUNNER_TEMP/stagea_dm.err" || dm_rc=$?
           printf '%s\n' "$dm_rc" > "$RUNNER_TEMP/stagea_dm_rc"
           echo "dm_poll_elapsed_s=$(( $(date +%s) - dm_start ))"
           cat "$RUNNER_TEMP/stagea_dm.out"
