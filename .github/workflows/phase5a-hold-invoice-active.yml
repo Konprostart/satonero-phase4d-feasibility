@@ -741,44 +741,6 @@ jobs:
               --recipient-secret-file /run/recipient.hex --order-id "$ORDER" \
               --since "$TSTART" --expect "$action"
           }
-          poll_order_active() {
-            # Diagnostic only: the daemon publishes the replaceable kind 38383
-            # order event (status "active") before it enqueues the two Active
-            # DMs, so this poll splits "transition never persisted" from
-            # "persisted but the DMs were not visible yet". Never gates.
-            deadline=$(( DM_START + 60 )); attempts=0; rc=1
-            expr="select(.kind==38383 and .pubkey==\"$DAEMON\" and ([.tags[]|select(.[0]==\"d\")]==[[\"d\",\"$ORDER\"]]) and ([.tags[]|select(.[0]==\"s\")]==[[\"s\",\"active\"]])) | .id"
-            : > "$TEMP/stagea_order38383.log"
-            : > "$TEMP/stagea_order38383.out"
-            while :; do
-              remaining=$((deadline - $(date +%s)))
-              [ "$remaining" -gt 0 ] || break
-              [ "$remaining" -le 15 ] || remaining=15
-              attempts=$((attempts + 1))
-              ts=$(date +%s); rc=0; ids=""
-              ids=$(timeout "$remaining" docker run --rm --network mostro-regtest_default \
-                --entrypoint nak mostro-regtest-nostr_relay \
-                req -k 38383 -a "$DAEMON" -t "d=$ORDER" --limit 5 --jq "$expr" --jq-raw \
-                ws://nostr_relay:8080 2> "$TEMP/stagea_order38383.err") || rc=$?
-              n=$(printf '%s\n' "$ids" | grep -Ec '^[0-9a-f]{64}$' || true)
-              printf 'ts=%s attempt=%s rc=%s ids=%s elapsed_s=%s\n' \
-                "$ts" "$attempts" "$rc" "$n" "$(( $(date +%s) - DM_START ))" >> "$TEMP/stagea_order38383.log"
-              if [ "$rc" -eq 0 ] && [ "$n" -eq 1 ]; then
-                printf '%s\n' "$ids" | grep -E '^[0-9a-f]{64}$' | head -1 > "$TEMP/stagea_order38383.out"
-                printf 'order38383_active=1\n' >> "$TEMP/stagea_order38383.out"
-                printf 'order38383_first_seen_elapsed_s=%s\n' "$(( $(date +%s) - DM_START ))" >> "$TEMP/stagea_order38383.out"
-                return 0
-              fi
-              [ "$n" -le 1 ] || break
-              remaining=$((deadline - $(date +%s)))
-              [ "$remaining" -gt 0 ] || break
-              [ "$remaining" -le 3 ] || remaining=3
-              sleep "$remaining"
-            done
-            printf 'order38383_active=0\n' >> "$TEMP/stagea_order38383.out"
-            printf 'order38383_first_seen_elapsed_s=absent\n' >> "$TEMP/stagea_order38383.out"
-            return 1
-          }
           run_diag() {
             keyfile="$1"; recipient="$2"; action="$3"
             deadline=$(( $(date +%s) + 60 )); attempt=0; out=""; rc=1
@@ -814,14 +776,9 @@ jobs:
               "$action" "$attempt" "$rc" "$(( $(date +%s) - DM_START ))" >> "$TEMP/stagea_dm_timing.log"
             return "$rc"
           }
-          order_rc=0
-          poll_order_active > "$TEMP/stagea_order38383.stdout" 2>&1 &
-          ORDER_PID=$!
           dm_rc=0
           run_diag maker.hex "$MAKER" buyer-took-order || dm_rc=$?
           run_diag taker.hex "$TAKER" hold-invoice-payment-accepted || dm_rc=$?
-          wait "$ORDER_PID" || order_rc=$?
-          printf 'order38383_rc=%s\n' "$order_rc" >> "$TEMP/stagea_dm_timing.log"
           exit "$dm_rc"
           SH
           chmod 700 "$RUNNER_TEMP/stagea_dm.sh"
@@ -831,7 +788,7 @@ jobs:
           printf '%s\n' "$dm_rc" > "$RUNNER_TEMP/stagea_dm_rc"
           echo "dm_poll_elapsed_s=$(( $(date +%s) - dm_start ))"
           cat "$RUNNER_TEMP/stagea_dm.out"
-          for f in stagea_dm_timing.log stagea_dm_attempts.log stagea_order38383.log stagea_order38383.out; do
+          for f in stagea_dm_timing.log stagea_dm_attempts.log; do
             if [ -f "$RUNNER_TEMP/$f" ]; then echo "--- $f"; cat "$RUNNER_TEMP/$f"; fi
           done
           if [ "$dm_rc" -ne 0 ]; then
@@ -994,7 +951,7 @@ jobs:
                           vals[key] = counted(value, name)
               diag[name] = vals
           for name in ('stagea_dm.out', 'stagea_dm_attempts.log', 'stagea_dm_timing.log',
-                       'stagea_order38383.log', 'stagea_order38383.out', 'stagea_dm_rc'):
+                       'stagea_dm_rc'):
               p = rt / name
               if p.exists():
                   text = p.read_text(errors='replace')[-60000:]
@@ -1090,7 +1047,7 @@ jobs:
           fi
           cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
           if [ -n "$cid" ]; then docker exec "$cid" sh -c 'rm -rf /tmp/stagea_dm /tmp/stagea_dm.sh' || true; fi
-          rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/safe-artifact" "$RUNNER_TEMP/stagea_diagnostics" "$RUNNER_TEMP/stagea_daemon.raw.log" "$RUNNER_TEMP/stagea_dm_attempts.log" "$RUNNER_TEMP/stagea_dm_timing.log" "$RUNNER_TEMP/stagea_dm_rc" "$RUNNER_TEMP/stagea_dm.sh" "$RUNNER_TEMP/stagea_hold" "$RUNNER_TEMP/stagea_payout" "$RUNNER_TEMP/stagea_vars" "$RUNNER_TEMP/stagea_payment_state" "$RUNNER_TEMP/stagea_tstart" "$RUNNER_TEMP/stagea_pay_pid" "$RUNNER_TEMP/stagea_dm.out" "$RUNNER_TEMP/stagea_dm.err" "$RUNNER_TEMP/stagea_order38383.log" "$RUNNER_TEMP/stagea_order38383.out" "$RUNNER_TEMP/stagea_order38383.err" "$RUNNER_TEMP/stagea_order38383.stdout" "$RUNNER_TEMP"/stagea_dm_*.err "$RUNNER_TEMP/alice_pay.out" "$RUNNER_TEMP/alice_pay.err" "$RUNNER_TEMP/taker_invoice.txt" "$RUNNER_TEMP/addinvoice.sh" "$RUNNER_TEMP/addinvoice.out" "$RUNNER_TEMP/addinvoice.err" "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/taker.hex" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/taker.pub" "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/taker.sh" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/shape.txt" "$RUNNER_TEMP/secret_gate.txt" || true
+          rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/safe-artifact" "$RUNNER_TEMP/stagea_diagnostics" "$RUNNER_TEMP/stagea_daemon.raw.log" "$RUNNER_TEMP/stagea_dm_attempts.log" "$RUNNER_TEMP/stagea_dm_timing.log" "$RUNNER_TEMP/stagea_dm_rc" "$RUNNER_TEMP/stagea_dm.sh" "$RUNNER_TEMP/stagea_hold" "$RUNNER_TEMP/stagea_payout" "$RUNNER_TEMP/stagea_vars" "$RUNNER_TEMP/stagea_payment_state" "$RUNNER_TEMP/stagea_tstart" "$RUNNER_TEMP/stagea_pay_pid" "$RUNNER_TEMP/stagea_dm.out" "$RUNNER_TEMP/stagea_dm.err" "$RUNNER_TEMP"/stagea_dm_*.err "$RUNNER_TEMP/alice_pay.out" "$RUNNER_TEMP/alice_pay.err" "$RUNNER_TEMP/taker_invoice.txt" "$RUNNER_TEMP/addinvoice.sh" "$RUNNER_TEMP/addinvoice.out" "$RUNNER_TEMP/addinvoice.err" "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/taker.hex" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/taker.pub" "$RUNNER_TEMP/daemon.nsec" "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/taker.sh" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" "$RUNNER_TEMP/taker.out" "$RUNNER_TEMP/taker.err" "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/shape.txt" "$RUNNER_TEMP/secret_gate.txt" || true
           docker rm -f satonero-daemon >/dev/null 2>&1 || true
           docker volume rm satonero-config >/dev/null 2>&1 || true
           docker compose down -v || true
@@ -1105,7 +1062,7 @@ jobs:
           if python3 - "$RUNNER_TEMP" <<'PY'
           import pathlib, sys
           root=pathlib.Path(sys.argv[1])
-          names=('maker.hex','taker.hex','daemon.nsec','maker.pub','taker.pub','daemon.pub','settings.toml','maker.sh','taker.sh','addinvoice.sh','maker.out','maker.err','taker.out','taker.err','addinvoice.out','addinvoice.err','taker_invoice.txt','order_id.txt','shape.txt','invoice_shape.txt','handshake_result.txt','secret_gate.txt','evidence','safe-artifact','stagea_diagnostics','stagea_daemon.raw.log','stagea_dm_attempts.log','stagea_dm_timing.log','stagea_dm_rc','stagea_hold','stagea_payout','stagea_vars','stagea_payment_state','stagea_tstart','stagea_pay_pid','stagea_dm.sh','stagea_dm.out','stagea_dm.err','stagea_order38383.log','stagea_order38383.out','stagea_order38383.err','stagea_order38383.stdout','alice_pay.out','alice_pay.err')
+          names=('maker.hex','taker.hex','daemon.nsec','maker.pub','taker.pub','daemon.pub','settings.toml','maker.sh','taker.sh','addinvoice.sh','maker.out','maker.err','taker.out','taker.err','addinvoice.out','addinvoice.err','taker_invoice.txt','order_id.txt','shape.txt','invoice_shape.txt','handshake_result.txt','secret_gate.txt','evidence','safe-artifact','stagea_diagnostics','stagea_daemon.raw.log','stagea_dm_attempts.log','stagea_dm_timing.log','stagea_dm_rc','stagea_hold','stagea_payout','stagea_vars','stagea_payment_state','stagea_tstart','stagea_pay_pid','stagea_dm.sh','stagea_dm.out','stagea_dm.err','alice_pay.out','alice_pay.err')
           try:
               root.lstat(); left=[]
               for name in names:
