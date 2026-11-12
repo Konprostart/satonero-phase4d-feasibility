@@ -585,6 +585,54 @@ jobs:
           exit 1
           SH
           chmod 700 "$RUNNER_TEMP/payer.sh"
+      - name: Write the orderbook watcher (host side)
+        run: |
+          set +x
+          umask 077
+          cat > "$RUNNER_TEMP/watch38383.sh" <<'SH'
+          #!/bin/bash
+          # Records the daemon's kind-38383 `s=in-progress` revision while the
+          # trade is live. A parameterized replaceable event can be superseded
+          # by a later revision, and a relay may answer a `#d` tag filter
+          # differently from a plain author filter, so the gate must not depend
+          # on finding the revision only at the end of the run. The script
+          # queries ALL of the daemon's kind-38383 events (no tag filter) and
+          # selects the one with d=<order> and s=in-progress locally.
+          set -u
+          umask 077
+          cd "$GITHUB_WORKSPACE/mostro-regtest" || exit 1
+          DAEMON="$1"; ORDER="$2"
+          OUT="$RUNNER_TEMP/watcher38383.json"
+          SEEN="$RUNNER_TEMP/watcher38383_seen.jsonl"
+          LOG="$RUNNER_TEMP/watcher38383.log"
+          ERR="$RUNNER_TEMP/watcher38383.err"
+          : > "$OUT"; : > "$SEEN"; : > "$LOG"; : > "$ERR"
+          echo "WATCHING daemon=$DAEMON order=$ORDER" >> "$LOG"
+          for i in $(seq 1 300); do
+            : > "$RUNNER_TEMP/watcher38383_poll.json"
+            timeout 40 docker compose exec -T nostr_relay nak -v req -k 38383 -a "$DAEMON" --limit 50 \
+              ws://localhost:8080 < /dev/null > "$RUNNER_TEMP/watcher38383_poll.json" 2>> "$ERR" || true
+            jq -sc '.' "$RUNNER_TEMP/watcher38383_poll.json" > "$RUNNER_TEMP/watcher38383_poll.tmp" 2>/dev/null \
+              || echo '[]' > "$RUNNER_TEMP/watcher38383_poll.tmp"
+            mv "$RUNNER_TEMP/watcher38383_poll.tmp" "$RUNNER_TEMP/watcher38383_poll.json"
+            jq -c '.[]' "$RUNNER_TEMP/watcher38383_poll.json" >> "$SEEN" 2>/dev/null || true
+            match=$(jq -c --arg d "$ORDER" \
+              'map(select((.tags | any(.[0]=="d" and .[1]==$d)) and (.tags | any(.[0]=="s" and .[1]=="in-progress")))) | .[0] // empty' \
+              "$RUNNER_TEMP/watcher38383_poll.json" 2>/dev/null || true)
+            if [ -n "$match" ]; then
+              printf '%s\n' "$match" > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+              echo "FOUND poll=$i created_at=$(printf '%s' "$match" | jq -r '.created_at')" >> "$LOG"
+              sort -u "$SEEN" -o "$SEEN" 2>/dev/null || true
+              exit 0
+            fi
+            sleep 2
+          done
+          sort -u "$SEEN" -o "$SEEN" 2>/dev/null || true
+          echo "TIMEOUT" >> "$LOG"
+          exit 3
+          SH
+          chmod 700 "$RUNNER_TEMP/watch38383.sh"
+          bash -n "$RUNNER_TEMP/watch38383.sh"
       - name: Enable KVM for the Android emulator
         run: |
           set -euo pipefail
@@ -606,6 +654,19 @@ jobs:
           done
           test -f "$RUNNER_TEMP/payer.status" || { echo 'FAIL: payer did not start'; exit 1; }
           echo "payer started pid=$(cat "$RUNNER_TEMP/payer.pid")"
+      - name: Launch the orderbook watcher in the background
+        working-directory: mostro-regtest
+        run: |
+          set -euo pipefail
+          nohup bash "$RUNNER_TEMP/watch38383.sh" "$(cat "$RUNNER_TEMP/daemon.pub")" "$(cat "$RUNNER_TEMP/order_id.txt")" \
+            > "$RUNNER_TEMP/watcher38383.out" 2>&1 &
+          echo $! > "$RUNNER_TEMP/watcher38383.pid"
+          for i in $(seq 1 30); do
+            [ -s "$RUNNER_TEMP/watcher38383.log" ] && break
+            sleep 1
+          done
+          test -s "$RUNNER_TEMP/watcher38383.log" || { echo 'FAIL: orderbook watcher did not start'; exit 1; }
+          echo "orderbook watcher started pid=$(cat "$RUNNER_TEMP/watcher38383.pid")"
       - name: Write the Gate 6A emulator script
         run: |
           set +x
@@ -707,20 +768,50 @@ jobs:
           # s=active revision (this is the dead probe already dropped in Phase
           # 5A). The last publishable revision of this order is s=in-progress,
           # which proves the daemon accepted the take and moved it off the book.
-          : > "$RUNNER_TEMP/active38383.json"
+          #
+          # The revision is captured live by watch38383.sh while the trade is
+          # running, and the end-of-run fallback below queries EVERY kind-38383
+          # event of the daemon (no `#d` tag filter) and selects the revision
+          # locally. Neither path assumes the replaceable event is still the
+          # newest one on the relay when the assertions start.
+          : > "$RUNNER_TEMP/inprogress38383.json"
+          capture_order_events() {
+            : > "$RUNNER_TEMP/watcher38383_poll.json"
+            timeout 60 docker compose exec -T nostr_relay nak -v req -k 38383 -a "$DAEMON_PUB" --limit 50 \
+              ws://localhost:8080 < /dev/null \
+              > "$RUNNER_TEMP/watcher38383_poll.json" 2>> "$RUNNER_TEMP/nak38383.err" || true
+            jq -sc '.' "$RUNNER_TEMP/watcher38383_poll.json" > "$RUNNER_TEMP/daemon38383_all.json" 2>/dev/null \
+              || echo '[]' > "$RUNNER_TEMP/daemon38383_all.json"
+          }
           for i in $(seq 1 30); do
-            timeout 40 docker compose exec -T nostr_relay nak -v req -k 38383 -a "$DAEMON_PUB" -t d="$ORDER" --limit 10 \
-              --jq 'select(any(.tags[]; .[0]=="s" and .[1]=="in-progress"))' ws://localhost:8080 < /dev/null \
-              > "$RUNNER_TEMP/active38383.json" 2>/dev/null || true
-            jq -e 'select(.kind == 38383)' "$RUNNER_TEMP/active38383.json" >/dev/null 2>&1 && break
+            if [ -s "$RUNNER_TEMP/watcher38383.json" ]; then
+              cp "$RUNNER_TEMP/watcher38383.json" "$RUNNER_TEMP/inprogress38383.json"
+            fi
+            capture_order_events
+            if [ ! -s "$RUNNER_TEMP/inprogress38383.json" ]; then
+              jq -c --arg d "$ORDER" \
+                'map(select((.tags | any(.[0]=="d" and .[1]==$d)) and (.tags | any(.[0]=="s" and .[1]=="in-progress")))) | .[0] // empty' \
+                "$RUNNER_TEMP/daemon38383_all.json" > "$RUNNER_TEMP/inprogress38383.json" 2>/dev/null || true
+            fi
+            [ -s "$RUNNER_TEMP/inprogress38383.json" ] && break
             sleep 5
           done
-          jq -e 'select(.kind == 38383 and (.tags | any(.[0]=="s" and .[1]=="in-progress")))' \
-            "$RUNNER_TEMP/active38383.json" >/dev/null 2>&1 \
+          # Evidence of what the relay actually held, whatever the verdict.
+          echo "daemon kind-38383 event count on relay: $(jq 'length' "$RUNNER_TEMP/daemon38383_all.json" 2>/dev/null || echo 0)"
+          jq -r '.[] | " 38383 id=\(.id) created_at=\(.created_at) d=\((.tags|map(select(.[0]=="d")|.[1])|first)//"-") s=\((.tags|map(select(.[0]=="s")|.[1])|first)//"-")"' \
+            "$RUNNER_TEMP/daemon38383_all.json" 2>/dev/null || true
+          echo "live capture log:"; cat "$RUNNER_TEMP/watcher38383.log" 2>/dev/null || echo ' (no watcher log)'
+          [ -s "$RUNNER_TEMP/inprogress38383.json" ] \
             || { echo 'FAIL: daemon never published status in-progress for the order'; exit 1; }
-          docker compose exec -T nostr_relay nak verify < "$RUNNER_TEMP/active38383.json" >/dev/null 2>&1 \
+          # The captured event must be this order's in-progress revision and
+          # must be signed by the daemon.
+          jq -e --arg d "$ORDER" --arg daemon "$DAEMON_PUB" \
+            '.kind == 38383 and .pubkey == $daemon and (.tags | any(.[0]=="d" and .[1]==$d)) and (.tags | any(.[0]=="s" and .[1]=="in-progress"))' \
+            "$RUNNER_TEMP/inprogress38383.json" >/dev/null 2>&1 \
+            || { echo 'FAIL: captured kind-38383 event is not this order in-progress revision'; exit 1; }
+          docker compose exec -T nostr_relay nak verify < "$RUNNER_TEMP/inprogress38383.json" >/dev/null 2>&1 \
             || { echo 'FAIL: in-progress order event signature'; exit 1; }
-          echo 'daemon published a signed kind-38383 in-progress event'
+          echo 'daemon published a signed kind-38383 in-progress event for the order'
 
           # (3) The app's own protocol messages are on the relay.
           timeout 40 docker compose exec -T nostr_relay nak req -k 14 -t p="$DAEMON_PUB" --limit 200 ws://localhost:8080 < /dev/null \
@@ -782,6 +873,9 @@ jobs:
           D="$RUNNER_TEMP/phase6a_diagnostics"
           mkdir -p "$D"; chmod 700 "$D"
           docker logs --timestamps satonero-daemon > "$RUNNER_TEMP/phase6a_daemon.raw.log" 2>&1 || true
+          # Relay-side view of the protocol: whether the kind-38383 in-progress
+          # revision was ever accepted, and how the later REQs were answered.
+          docker logs --timestamps nostr_relay > "$RUNNER_TEMP/phase6a_relay.raw.log" 2>&1 || true
           python3 - "$RUNNER_TEMP" "$D" <<'PY'
           import json, os, pathlib, re, sys
           rt = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2])
@@ -797,6 +891,32 @@ jobs:
                   if keep.search(line[:500]):
                       lines.append(sanitize(line[:500]))
           (out / 'daemon_events.log').write_text(('\n'.join(lines) + '\n') if lines else '')
+          relay_raw = rt / 'phase6a_relay.raw.log'
+          if relay_raw.exists():
+              relay_lines = [sanitize(l[:500]) for l in relay_raw.read_text(errors='replace').splitlines()[-4000:]]
+              (out / 'relay_events.log').write_text(('\n'.join(relay_lines) + '\n') if relay_lines else '')
+          # Full daemon kind-38383 view: the end-of-run dump plus every distinct
+          # revision the live watcher saw while the trade was running.
+          for name, dest in (('daemon38383_all.json', 'order38383_all.json'),
+                             ('watcher38383_seen.jsonl', 'order38383_seen.jsonl'),
+                             ('watcher38383.json', 'order38383_inprogress.json'),
+                             ('watcher38383.log', 'watcher38383.log'),
+                             ('watcher38383.err', 'watcher38383.err'),
+                             ('nak38383.err', 'nak38383.err')):
+              p = rt / name
+              if not p.exists():
+                  continue
+              body = p.read_text(errors='replace')
+              if name == 'daemon38383_all.json':
+                  # Keep the diagnostics valid JSON: at most 100 events.
+                  try:
+                      events = json.loads(body) if body.strip() else []
+                      body = json.dumps(events[:100], indent=2)
+                  except (ValueError, TypeError):
+                      body = body[-80000:]
+              else:
+                  body = body[-80000:]
+              (out / dest).write_text(sanitize(body))
           for name in ('payer.out', 'findhold.out', 'payer_state', 'phase6a_vars',
                        'flutter_integration.out'):
               p = rt / name
@@ -824,7 +944,7 @@ jobs:
           print('diagnostics captured: ' + ', '.join(sorted(f.name for f in out.iterdir())))
           print('diagnostic secret scan: redactions=%d' % total)
           PY
-          rm -f "$RUNNER_TEMP/phase6a_daemon.raw.log" "$RUNNER_TEMP/taker_invoice.txt" \
+          rm -f "$RUNNER_TEMP/phase6a_daemon.raw.log" "$RUNNER_TEMP/phase6a_relay.raw.log" "$RUNNER_TEMP/taker_invoice.txt" \
                 "$RUNNER_TEMP/hold_invoice.txt" "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/daemon.nsec" \
                 "$RUNNER_TEMP/hold_pay_invoice.plain" "$RUNNER_TEMP/settings.toml"
       - name: Upload Phase 6A diagnostics (always)
@@ -848,6 +968,10 @@ jobs:
           fi
           if [ -f "$RUNNER_TEMP/payer.pid" ]; then
             pid=$(cat "$RUNNER_TEMP/payer.pid" 2>/dev/null || true)
+            [ -n "$pid" ] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+          fi
+          if [ -f "$RUNNER_TEMP/watcher38383.pid" ]; then
+            pid=$(cat "$RUNNER_TEMP/watcher38383.pid" 2>/dev/null || true)
             [ -n "$pid" ] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
           fi
           ln_mostro() { docker compose exec -T --user lnd mostro_lnd lncli --network=regtest --rpcserver=localhost:10001 "$@"; }
@@ -879,6 +1003,7 @@ jobs:
           cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
           if [ -n "$cid" ]; then docker exec "$cid" sh -c 'rm -rf /tmp/evidence /tmp/maker.sh /tmp/findhold.sh /tmp/maker.hex' || true; fi
           rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/phase6a_diagnostics" "$RUNNER_TEMP/phase6a_daemon.raw.log" \
+                 "$RUNNER_TEMP/phase6a_relay.raw.log" \
                  "$RUNNER_TEMP"/phase6a_* "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/daemon.nsec" \
                  "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/findhold.sh" \
                  "$RUNNER_TEMP/payer.sh" "$RUNNER_TEMP/payer.out" "$RUNNER_TEMP/payer.pid" "$RUNNER_TEMP/payer.status" \
@@ -887,7 +1012,12 @@ jobs:
                  "$RUNNER_TEMP/order_id.txt" "$RUNNER_TEMP/maker.out" "$RUNNER_TEMP/maker.err" \
                  "$RUNNER_TEMP/all14.json" "$RUNNER_TEMP/app_msgs.json" "$RUNNER_TEMP/active38383.json" \
                  "$RUNNER_TEMP/app_msg_count.txt" "$RUNNER_TEMP/app_msg_p.txt" "$RUNNER_TEMP/alice_pay.out" \
-                 "$RUNNER_TEMP/alice_pay.pid" "$RUNNER_TEMP/flutter_integration.out" || true
+                 "$RUNNER_TEMP/alice_pay.pid" "$RUNNER_TEMP/flutter_integration.out" \
+                 "$RUNNER_TEMP/watch38383.sh" "$RUNNER_TEMP/watcher38383.json" "$RUNNER_TEMP/watcher38383.json.tmp" \
+                 "$RUNNER_TEMP/watcher38383_seen.jsonl" "$RUNNER_TEMP/watcher38383.log" "$RUNNER_TEMP/watcher38383.err" \
+                 "$RUNNER_TEMP/watcher38383.out" "$RUNNER_TEMP/watcher38383.pid" "$RUNNER_TEMP/watcher38383_poll.json" \
+                 "$RUNNER_TEMP/watcher38383_poll.tmp" "$RUNNER_TEMP/daemon38383_all.json" \
+                 "$RUNNER_TEMP/inprogress38383.json" "$RUNNER_TEMP/nak38383.err" || true
           docker rm -f satonero-daemon >/dev/null 2>&1 || true
           docker volume rm satonero-config >/dev/null 2>&1 || true
           docker compose down -v || true
@@ -908,9 +1038,14 @@ jobs:
                    'taker_invoice.txt', 'order_id.txt', 'maker.out', 'maker.err', 'all14.json',
                    'app_msgs.json', 'active38383.json', 'app_msg_count.txt', 'app_msg_p.txt',
                    'alice_pay.out', 'alice_pay.pid', 'flutter_integration.out', 'phase6a_vars',
-                   'evidence', 'phase6a_diagnostics', 'phase6a_daemon.raw.log')
+                   'evidence', 'phase6a_diagnostics', 'phase6a_daemon.raw.log', 'phase6a_relay.raw.log',
+                   'watch38383.sh', 'watcher38383.json', 'watcher38383.json.tmp', 'watcher38383_seen.jsonl',
+                   'watcher38383.log', 'watcher38383.err', 'watcher38383.out', 'watcher38383.pid',
+                   'watcher38383_poll.json', 'watcher38383_poll.tmp', 'daemon38383_all.json',
+                   'inprogress38383.json', 'nak38383.err')
           left = [n for n in names if (root / n).exists()]
           left.extend(p.name for p in root.glob('phase6a_*'))
+          left.extend(p.name for p in root.glob('watcher38383*'))
           if left:
               print('runner-temp resources remain: ' + ','.join(sorted(set(left))))
               raise SystemExit(1)
