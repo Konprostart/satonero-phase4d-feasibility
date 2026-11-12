@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Konprostart/Satonero
-          ref: 378a5c60833adee143861c5c8e9c5eb0544ec0a7
+          ref: ${{ env.DAEMON_SHA }}
           path: satonero
           persist-credentials: false
           fetch-depth: 1
