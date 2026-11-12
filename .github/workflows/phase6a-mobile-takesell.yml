@@ -616,6 +616,11 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: |
+            # reactivecircus/android-emulator-runner runs `script:` with
+            # /usr/bin/sh (dash), which has no `set -o pipefail` and no
+            # PIPESTATUS. Write the gate body to a file and exec it with bash so
+            # the pipefail/PIPESTATUS checks below are real.
+            cat > "$RUNNER_TEMP/gate6a.sh" <<'GATE6A'
             set -euo pipefail
             adb wait-for-device
             # The app requests POST_NOTIFICATIONS during bootstrap and awaits
@@ -639,6 +644,8 @@ jobs:
               --dart-define=REGTEST_RELAY_URL=ws://10.0.2.2:8080 \
               2>&1 | tee "$RUNNER_TEMP/flutter_integration.out"
             test "${PIPESTATUS[0]}" = 0
+            GATE6A
+            exec bash "$RUNNER_TEMP/gate6a.sh"
       - name: Collect payer result
         if: always()
         working-directory: mostro-regtest
