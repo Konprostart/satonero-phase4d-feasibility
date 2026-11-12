@@ -1,16 +1,12 @@
 name: phase6a-mobile-takesell
 # Phase 6A-0 + 6A — first real Satonero Android app ↔ Satonero daemon trade.
 #
-# STAGED LOCATION. GitHub only registers and dispatches `workflow_dispatch`
-# workflows that live at `.github/workflows/` on the default branch, and the
-# pushing credential had no `workflow` scope, so this file is committed here
-# instead. Activate it with:
+# Activated: this file lives at `.github/workflows/` on main so that
+# `workflow_dispatch` can run it. Dispatch once with:
 #
-#   git mv ci/phase6a-mobile-takesell.yml .github/workflows/
-#   git commit -m "ci: activate the Phase 6A mobile-to-daemon gate"
-#   git push origin main
+#   gh workflow run phase6a-mobile-takesell --ref main
 #
-# Nothing else about the workflow changes.
+# Nothing about the gate itself changed when it was moved here.
 #
 # Two sequential gates in one manually dispatched run:
 #   6A-0  the app boots against the regtest relay, discovers the CLI maker's
@@ -36,6 +32,12 @@ jobs:
       DAEMON_SHA: 378a5c60833adee143861c5c8e9c5eb0544ec0a7
       REGTEST_SHA: c6adbdaaaf0a2152a0728dbce6adf11945f547bd
       MOBILE_SHA: 22ec7cb0d0cdfd7f492ca707f370861b13332658
+      # android/app/build.gradle throws at configuration time when no release
+      # keystore exists, so every Gradle invocation in this job needs the same
+      # CI-only escape hatch that Satonero-mobile's own workflows use
+      # (satonero-ci.yml, private-mode-validation.yml). It only affects release
+      # builds; this job builds and runs DEBUG APKs and publishes nothing.
+      ALLOW_DEBUG_SIGNING: "true"
     steps:
       - name: Pre-flight and disk gate
         run: |
