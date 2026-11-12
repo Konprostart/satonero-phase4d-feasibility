@@ -433,6 +433,91 @@ jobs:
           grep -q '^FINAL=SELECTED$' "$RUNNER_TEMP/maker.out" || { echo "FAIL: maker new-order did not reach SELECTED"; exit 1; }
           [ -n "$order" ] || { echo "FAIL: no order id"; exit 1; }
           echo "GATE 6A-0 maker order published: $order"
+      - name: Write the relay read helper and self-test it on the maker order
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          umask 077
+          D=$(cat "$RUNNER_TEMP/daemon.pub")
+          # Runner-side nak: the very binary the relay image carries, so this
+          # client path has no version drift and needs no network download.
+          docker run --rm --entrypoint cat mostro-regtest-nostr_relay /usr/local/bin/nak \
+            > "$RUNNER_TEMP/nak-host" 2>/dev/null || true
+          if [ -s "$RUNNER_TEMP/nak-host" ]; then chmod 700 "$RUNNER_TEMP/nak-host"; else rm -f "$RUNNER_TEMP/nak-host"; fi
+          echo "container nak version: $(docker compose exec -T nostr_relay nak --version 2>&1 | head -1 || true)"
+          echo "runner nak version:    $([ -x "$RUNNER_TEMP/nak-host" ] && "$RUNNER_TEMP/nak-host" --version 2>&1 | head -1 || echo unavailable)"
+          cat > "$RUNNER_TEMP/relayreq.sh" <<'SH'
+          #!/bin/bash
+          # Read events from the regtest relay for one filter, trying the client
+          # paths in order and stopping at the first one that returns events.
+          #
+          # Why more than one path: the gate used to read the relay only through
+          # `docker compose exec -T nostr_relay nak ...`. That exec path has been
+          # observed answering EOSE with zero events for filters the relay
+          # serves to clients on its published port at the same moment (the
+          # relay database and the relay log both show the event was persisted
+          # and served). What the gate has to verify is the relay's content, so
+          # a read is accepted from any client path that actually reaches the
+          # relay; every attempt is recorded in relay_req_paths.log, so the
+          # divergence stays visible instead of being hidden by the fallback.
+          set -u
+          umask 077
+          cd "$GITHUB_WORKSPACE/mostro-regtest" || exit 1
+          OUT="$1"; shift
+          TMP="$OUT.tmp"
+          LOG="$RUNNER_TEMP/relay_req_paths.log"
+          : > "$TMP"
+          try() {
+            label="$1"; shift
+            : > "$TMP"
+            case "$label" in
+              container-direct)
+                timeout 60 docker compose exec -T nostr_relay nak req "$@" ws://localhost:8080 \
+                  < /dev/null > "$TMP" 2>/dev/null || true ;;
+              container-sh)
+                quoted=$(printf '%q ' "$@")
+                timeout 60 docker compose exec -T nostr_relay sh -c "nak req $quoted ws://localhost:8080" \
+                  < /dev/null > "$TMP" 2>/dev/null || true ;;
+              host)
+                if [ ! -x "$RUNNER_TEMP/nak-host" ]; then
+                  echo "relayreq path=host SKIPPED unavailable args=$*" >> "$LOG"
+                  return 1
+                fi
+                timeout 60 "$RUNNER_TEMP/nak-host" req "$@" ws://localhost:8080 \
+                  < /dev/null > "$TMP" 2>/dev/null || true ;;
+            esac
+            n=$(jq -sc 'length' "$TMP" 2>/dev/null || echo 0)
+            echo "relayreq path=$label events=${n:-0} args=$*" >> "$LOG"
+            [ "${n:-0}" -gt 0 ] 2>/dev/null || return 1
+            cp "$TMP" "$OUT"
+            printf '%s\n' "$label" > "$RUNNER_TEMP/relay_req_last_path"
+            return 0
+          }
+          if try container-direct "$@" || try container-sh "$@" || try host "$@"; then
+            rc=0
+          else
+            : > "$OUT"
+            rc=1
+          fi
+          rm -f "$TMP"
+          exit "$rc"
+          SH
+          chmod 700 "$RUNNER_TEMP/relayreq.sh"
+          bash -n "$RUNNER_TEMP/relayreq.sh"
+          : > "$RUNNER_TEMP/relay_req_paths.log"
+          # Self-test: the maker's kind-38383 revision must be readable before
+          # the run spends ~30 minutes on the emulator.
+          rc=0
+          bash "$RUNNER_TEMP/relayreq.sh" "$RUNNER_TEMP/relayreq_probe.json" -k 38383 -a "$D" --limit 50 || rc=$?
+          echo "relay read self-test rc=$rc"
+          cat "$RUNNER_TEMP/relay_req_paths.log"
+          probe=$(jq -sc 'length' "$RUNNER_TEMP/relayreq_probe.json" 2>/dev/null || echo 0)
+          echo "relay read self-test: events=$probe read_path=$(cat "$RUNNER_TEMP/relay_req_last_path" 2>/dev/null || echo none)"
+          jq -r '.[]? | " 38383 id=\(.id) d=\((.tags|map(select(.[0]=="d")|.[1])|first)//"-") s=\((.tags|map(select(.[0]=="s")|.[1])|first)//"-")"' \
+            "$RUNNER_TEMP/relayreq_probe.json" 2>/dev/null || true
+          [ "${probe:-0}" -gt 0 ] || { echo 'FAIL: no client path could read the maker order from the relay'; exit 1; }
+          echo 'relay read self-test passed'
       - name: Fund seller and open exactly one regtest channel to the daemon
         working-directory: mostro-regtest
         run: |
@@ -610,8 +695,8 @@ jobs:
           echo "WATCHING daemon=$DAEMON order=$ORDER" >> "$LOG"
           for i in $(seq 1 300); do
             : > "$RUNNER_TEMP/watcher38383_poll.json"
-            timeout 40 docker compose exec -T nostr_relay nak -v req -k 38383 -a "$DAEMON" --limit 50 \
-              ws://localhost:8080 < /dev/null > "$RUNNER_TEMP/watcher38383_poll.json" 2>> "$ERR" || true
+            bash "$RUNNER_TEMP/relayreq.sh" "$RUNNER_TEMP/watcher38383_poll.json" \
+              -k 38383 -a "$DAEMON" --limit 50 >> "$ERR" 2>&1 || true
             jq -sc '.' "$RUNNER_TEMP/watcher38383_poll.json" > "$RUNNER_TEMP/watcher38383_poll.tmp" 2>/dev/null \
               || echo '[]' > "$RUNNER_TEMP/watcher38383_poll.tmp"
             mv "$RUNNER_TEMP/watcher38383_poll.tmp" "$RUNNER_TEMP/watcher38383_poll.json"
@@ -796,6 +881,10 @@ jobs:
                 return 0
               fi
               timeout 60 "$HOST_NAK" req "$@" ws://localhost:8080 < /dev/null > "$out" 2> "$err"
+            elif [ "$where" = container-sh ]; then
+              quoted=$(printf '%q ' "$@")
+              timeout 60 docker compose exec -T nostr_relay sh -c "nak req $quoted ws://localhost:8080" \
+                < /dev/null > "$out" 2> "$err"
             else
               timeout 60 docker compose exec -T nostr_relay nak req "$@" ws://localhost:8080 < /dev/null > "$out" 2> "$err"
             fi
@@ -824,11 +913,20 @@ jobs:
           q c_info_only            container -k 38385 -a "$D"
           q c_info_limit           container -k 38385 -a "$D" --limit 5
           q c_dm_limit             container -k 14 -a "$D" --limit 50
+          # Same filters again through the two axes that could distinguish the
+          # paths: the shell wrapper, and nak's client-side --jq option.
+          q c_author_limit_jq      container -k 38383 -a "$D" --limit 50 --jq .id --jq-raw
+          q c_dm_limit_jq          container -k 14 -a "$D" --limit 50 --jq .id --jq-raw
+          q s_author_limit         container-sh -k 38383 -a "$D" --limit 50
+          q s_author_limit_jq      container-sh -k 38383 -a "$D" --limit 50 --jq .id --jq-raw
+          q s_dm_limit             container-sh -k 14 -a "$D" --limit 50
           # Same queries again over the published host port, from the runner.
           q h_author_limit         host      -k 38383 -a "$D" --limit 50
           q h_author_only          host      -k 38383 -a "$D"
           q h_author_since_only    host      -k 38383 -a "$D" -s "$LOOKBACK"
           q h_app_filter           host      -k 38383 -k 38385 -a "$D" -s "$LOOKBACK"
+          echo "--- relay read helper path log"
+          cat "$RUNNER_TEMP/relay_req_paths.log" 2>/dev/null || true
           echo "--- matrix summary"
           cat "$M/summary.log"
       - name: Relay database inspection (diagnostic only)
@@ -991,9 +1089,8 @@ jobs:
           : > "$RUNNER_TEMP/inprogress38383.json"
           capture_order_events() {
             : > "$RUNNER_TEMP/watcher38383_poll.json"
-            timeout 60 docker compose exec -T nostr_relay nak -v req -k 38383 -a "$DAEMON_PUB" --limit 50 \
-              ws://localhost:8080 < /dev/null \
-              > "$RUNNER_TEMP/watcher38383_poll.json" 2>> "$RUNNER_TEMP/nak38383.err" || true
+            bash "$RUNNER_TEMP/relayreq.sh" "$RUNNER_TEMP/watcher38383_poll.json" \
+              -k 38383 -a "$DAEMON_PUB" --limit 50 >> "$RUNNER_TEMP/nak38383.err" 2>&1 || true
             jq -sc '.' "$RUNNER_TEMP/watcher38383_poll.json" > "$RUNNER_TEMP/daemon38383_all.json" 2>/dev/null \
               || echo '[]' > "$RUNNER_TEMP/daemon38383_all.json"
           }
@@ -1028,8 +1125,8 @@ jobs:
           echo 'daemon published a signed kind-38383 in-progress event for the order'
 
           # (3) The app's own protocol messages are on the relay.
-          timeout 40 docker compose exec -T nostr_relay nak req -k 14 -t p="$DAEMON_PUB" --limit 200 ws://localhost:8080 < /dev/null \
-            > "$RUNNER_TEMP/all14.json" 2>/dev/null || true
+          bash "$RUNNER_TEMP/relayreq.sh" "$RUNNER_TEMP/all14.json" \
+            -k 14 -t p="$DAEMON_PUB" --limit 200 || true
           jq -sc --arg daemon "$DAEMON_PUB" --arg maker "$MAKER_PUB" --argjson since "$TAPPSTART" \
             '[.[]? | select(.pubkey != $daemon and .pubkey != $maker and .created_at >= $since)]' \
             "$RUNNER_TEMP/all14.json" > "$RUNNER_TEMP/app_msgs.json" 2>/dev/null || echo '[]' > "$RUNNER_TEMP/app_msgs.json"
@@ -1178,7 +1275,8 @@ jobs:
                   body = body[-80000:]
               (out / dest).write_text(sanitize(body))
           for name in ('payer.out', 'findhold.out', 'payer_state', 'phase6a_vars',
-                       'flutter_integration.out'):
+                       'flutter_integration.out', 'relay_req_paths.log',
+                       'relayreq_probe.json'):
               p = rt / name
               if not p.exists():
                   continue
@@ -1264,7 +1362,9 @@ jobs:
           if [ -n "$cid" ]; then docker exec "$cid" sh -c 'rm -rf /tmp/evidence /tmp/maker.sh /tmp/findhold.sh /tmp/maker.hex' || true; fi
           rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/phase6a_diagnostics" "$RUNNER_TEMP/phase6a_daemon.raw.log" \
                  "$RUNNER_TEMP/phase6a_relay.raw.log" "$RUNNER_TEMP/relay_matrix" "$RUNNER_TEMP/relaydb" \
-                 "$RUNNER_TEMP/nak-host" \
+                 "$RUNNER_TEMP/nak-host" "$RUNNER_TEMP/relayreq.sh" \
+                 "$RUNNER_TEMP/relay_req_paths.log" "$RUNNER_TEMP/relay_req_last_path" \
+                 "$RUNNER_TEMP/relayreq_probe.json" "$RUNNER_TEMP/relayreq_probe.json.tmp" "$RUNNER_TEMP/all14.json.tmp" \
                  "$RUNNER_TEMP"/phase6a_* "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/daemon.nsec" \
                  "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/findhold.sh" \
                  "$RUNNER_TEMP/payer.sh" "$RUNNER_TEMP/payer.out" "$RUNNER_TEMP/payer.pid" "$RUNNER_TEMP/payer.status" \
