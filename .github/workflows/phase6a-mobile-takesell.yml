@@ -738,6 +738,220 @@ jobs:
           cat "$RUNNER_TEMP/payer_state" 2>/dev/null || echo missing
           echo "--- integration test markers"
           grep -a '^REGTEST_' "$RUNNER_TEMP/flutter_integration.out" 2>/dev/null || echo "no markers"
+      # ---------------------------------------------------------------------
+      # DIAGNOSTIC ONLY. These two steps exist to explain the relay visibility
+      # contradiction observed in run 43205148657: the app's own kind-38383
+      # subscription was served the maker order, while every `nak` query for
+      # that author returned zero events (including the plain
+      # `-k 38383 -a <daemon> --limit 50` shape used by gate assertion 2).
+      #
+      # They are read-only: only REQ frames and sqlite reads. They do not
+      # change, weaken or replace any gate assertion, and the assertion step
+      # still runs afterwards against the same live state.
+      # ---------------------------------------------------------------------
+      - name: Relay visibility control matrix (diagnostic only)
+        if: always()
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          umask 077
+          M="$RUNNER_TEMP/relay_matrix"
+          mkdir -p "$M"; chmod 700 "$M"
+          D=$(cat "$RUNNER_TEMP/daemon.pub")
+          ORDER=$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || true)
+          APP_SINCE=$(cat "$RUNNER_TEMP/phase6a_tappstart" 2>/dev/null || echo 0)
+          LOOKBACK=$((APP_SINCE - 172800))
+          # Host-side nak: extract the SAME pinned binary out of the relay image
+          # so the host path needs no network download and no version drift.
+          HOST_NAK="$RUNNER_TEMP/nak-host"
+          docker run --rm --entrypoint cat mostro-regtest-nostr_relay /usr/local/bin/nak \
+            > "$HOST_NAK" 2>/dev/null || true
+          if [ -s "$HOST_NAK" ]; then
+            chmod 700 "$HOST_NAK"
+            echo "host_nak=extracted-from-relay-image"
+          else
+            HOST_NAK=""
+            echo "host_nak=UNAVAILABLE"
+          fi
+          cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
+          echo "relay_container_id=$cid"
+          if [ -n "$cid" ]; then
+            docker inspect -f 'relay_state={{.State.Status}} relay_started_at={{.State.StartedAt}} relay_restarts={{.RestartCount}}' "$cid" || true
+          fi
+          echo "matrix_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "host_epoch=$(date -u +%s)"
+          echo "relay_container_epoch=$(docker compose exec -T nostr_relay date -u +%s 2>/dev/null || echo unavailable)"
+          echo "daemon_pubkey=$D"
+          echo "order=$ORDER app_since=$APP_SINCE lookback=$LOOKBACK"
+          : > "$M/summary.log"
+          : > "$M/raw.log"
+          q() {
+            label=$1; where=$2; shift 2
+            out="$M/$label.json"; err="$M/$label.err"
+            : > "$out"
+            if [ "$where" = host ]; then
+              if [ -z "$HOST_NAK" ]; then
+                echo "MATRIX $where/$label SKIPPED no-host-nak" | tee -a "$M/summary.log"
+                return 0
+              fi
+              timeout 60 "$HOST_NAK" req "$@" ws://localhost:8080 < /dev/null > "$out" 2> "$err"
+            else
+              timeout 60 docker compose exec -T nostr_relay nak req "$@" ws://localhost:8080 < /dev/null > "$out" 2> "$err"
+            fi
+            rc=$?
+            n=$(jq -sc 'length' "$out" 2>/dev/null || echo ERR)
+            ids=$(jq -sr '[.[]? | "\(.id[0:12])/k\(.kind)/s=\(([.tags[]? | select(.[0]=="s") | .[1]][0]) // "-")"] | join(",")' "$out" 2>/dev/null || true)
+            echo "MATRIX $where/$label rc=$rc events=$n ids=[$ids] args=$*" >> "$M/summary.log"
+            {
+              echo "===== $where/$label :: nak req $* :: ws://localhost:8080"
+              cat "$err" 2>/dev/null || true
+              cat "$out" 2>/dev/null || true
+              echo
+            } >> "$M/raw.log"
+          }
+          # The exact failing shape from gate assertion 2, then one variable at
+          # a time: since, until=0 floor, the known-good #d shape, no author,
+          # no limit, and two non-38383 controls.
+          q c_author_limit         container -k 38383 -a "$D" --limit 50
+          q c_author_since_limit   container -k 38383 -a "$D" -s "$LOOKBACK" --limit 50
+          q c_author_since0_limit  container -k 38383 -a "$D" -s 0 --limit 50
+          q c_author_d_limit       container -k 38383 -a "$D" -t "d=$ORDER" --limit 5
+          q c_kind_limit           container -k 38383 --limit 50
+          q c_author_only          container -k 38383 -a "$D"
+          q c_author_since_only    container -k 38383 -a "$D" -s "$LOOKBACK"
+          q c_app_filter           container -k 38383 -k 38385 -a "$D" -s "$LOOKBACK"
+          q c_info_only            container -k 38385 -a "$D"
+          q c_info_limit           container -k 38385 -a "$D" --limit 5
+          q c_dm_limit             container -k 14 -a "$D" --limit 50
+          # Same queries again over the published host port, from the runner.
+          q h_author_limit         host      -k 38383 -a "$D" --limit 50
+          q h_author_only          host      -k 38383 -a "$D"
+          q h_author_since_only    host      -k 38383 -a "$D" -s "$LOOKBACK"
+          q h_app_filter           host      -k 38383 -k 38385 -a "$D" -s "$LOOKBACK"
+          echo "--- matrix summary"
+          cat "$M/summary.log"
+      - name: Relay database inspection (diagnostic only)
+        if: always()
+        working-directory: mostro-regtest
+        run: |
+          set +x
+          set -uo pipefail
+          umask 077
+          DB="$RUNNER_TEMP/relaydb"
+          mkdir -p "$DB"; chmod 700 "$DB"
+          cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
+          if [ -z "$cid" ]; then
+            echo "relay container missing; database cannot be inspected" > "$DB/analysis.txt"
+            exit 0
+          fi
+          docker compose exec -T nostr_relay sh -c 'ls -la /home/dev/.nostr_relay/db' \
+            > "$DB/db_listing.txt" 2>&1 || true
+          for f in nostr.db nostr.db-wal nostr.db-shm; do
+            if docker cp "$cid:/home/dev/.nostr_relay/db/$f" "$DB/$f" 2>/dev/null; then
+              echo "copied $f"
+            else
+              echo "absent $f"
+            fi
+          done
+          python3 - "$DB" "$(cat "$RUNNER_TEMP/daemon.pub")" \
+            "$(cat "$RUNNER_TEMP/order_id.txt" 2>/dev/null || true)" \
+            "14f938cef0b02c46ab79faae0a2b560260dd34bcfde448d43ada642a887f2b29" \
+            > "$DB/py.out" 2>&1 <<'PY'
+          import os
+          import sqlite3
+          import sys
+
+          d, daemon, order, pending_id = sys.argv[1:5]
+          db = os.path.join(d, "nostr.db")
+          out = os.path.join(d, "analysis.txt")
+          lines = []
+
+          def p(*parts):
+              lines.append(" ".join(str(x) for x in parts))
+
+          if not os.path.exists(db):
+              p("nostr.db was not copied; nothing to inspect")
+              open(out, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+              raise SystemExit(0)
+
+          p("db_bytes=%d wal=%s shm=%s" % (
+              os.path.getsize(db), os.path.exists(db + "-wal"), os.path.exists(db + "-shm")))
+          con = sqlite3.connect(db)  # writable copy: lets sqlite replay the copied -wal
+          cur = con.cursor()
+
+          p("== event counts by kind")
+          for kind, n in cur.execute(
+                  "select kind, count(*) from event group by kind order by 2 desc, 1"):
+              p("  kind=%s count=%s" % (kind, n))
+          p("event_total=%s" % cur.execute("select count(*) from event").fetchone()[0])
+          p("hidden_rows=%s" % cur.execute("select count(*) from event where hidden=1").fetchone()[0])
+
+          p("== author column shape")
+          p("  distinct_length_author=%s" % [r[0] for r in cur.execute(
+              "select distinct length(author) from event")])
+          p("  daemon_pubkey_hex=%s" % daemon)
+          p("  rows_by_daemon_blob=%s" % cur.execute(
+              "select count(*) from event where author=?", (bytes.fromhex(daemon),)).fetchone()[0])
+          p("  rows_by_daemon_hex=%s" % cur.execute(
+              "select count(*) from event where hex(author)=?", (daemon,)).fetchone()[0])
+
+          p("== indexes on event")
+          p("  " + ", ".join(r[1] for r in cur.execute("pragma index_list(event)")))
+
+          p("== every kind-38383 row")
+          rows = list(cur.execute(
+              "select id, hex(event_hash), hex(author), created_at, expires_at, hidden, first_seen "
+              "from event where kind=38383"))
+          if not rows:
+              p("  (none)")
+          for row in rows:
+              (rid, ehash, author, created, exp, hidden, first_seen) = row
+              dvals = [r[0] for r in cur.execute(
+                  "select value from tag where event_id=? and name='d'", (rid,))]
+              svals = [r[0] for r in cur.execute(
+                  "select value from tag where event_id=? and name='s'", (rid,))]
+              p("  38383 rowid=%s id=%s author=%s created_at=%s expires_at=%s hidden=%s "
+                "first_seen=%s d=%s s=%s" % (
+                    rid, ehash, author, created, exp, hidden, first_seen, dvals, svals))
+
+          p("== tag rows with d=%s" % order)
+          tag_rows = list(cur.execute(
+              "select event_id, kind, created_at from tag where name='d' and value=?",
+              (order,)))
+          if not tag_rows:
+              p("  (none)")
+          for (ev, kind, created) in tag_rows:
+              p("  tag d row event_id=%s kind=%s tag_created_at=%s" % (ev, kind, created))
+              ev_row = cur.execute(
+                  "select hex(event_hash), kind, created_at, expires_at, hidden "
+                  "from event where id=?", (ev,)).fetchone()
+              p("    -> event %s" % (ev_row,))
+
+          p("== known pending order event id from the daemon log: %s" % pending_id)
+          hit = cur.execute(
+              "select hex(event_hash), kind, created_at, expires_at, hidden "
+              "from event where hex(event_hash)=?", (pending_id,)).fetchone()
+          p("  %s" % ("present: %s" % (hit,) if hit else "NOT PRESENT in relay db"))
+
+          p("== kind-14 / kind-0 / kind-10002 counts for the daemon")
+          for kind in (0, 14, 10002, 38385):
+              n = cur.execute(
+                  "select count(*) from event where kind=? and author=?",
+                  (kind, bytes.fromhex(daemon))).fetchone()[0]
+              p("  kind=%s daemon_rows=%s" % (kind, n))
+
+          con.close()
+          open(out, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+          if [ ! -f "$DB/analysis.txt" ]; then
+            {
+              echo "python relay db analysis failed; raw output below"
+              cat "$DB/py.out" 2>/dev/null || true
+            } > "$DB/analysis.txt"
+          fi
+          cat "$DB/analysis.txt" 2>/dev/null || true
       - name: Phase 6A gate assertions
         id: phase6a_gate
         if: always()
@@ -866,6 +1080,7 @@ jobs:
           echo 'gate=pass' >> "$GITHUB_OUTPUT"
       - name: Capture Phase 6A diagnostics (always)
         if: always()
+        working-directory: mostro-regtest
         run: |
           set +x
           set -uo pipefail
@@ -873,9 +1088,21 @@ jobs:
           D="$RUNNER_TEMP/phase6a_diagnostics"
           mkdir -p "$D"; chmod 700 "$D"
           docker logs --timestamps satonero-daemon > "$RUNNER_TEMP/phase6a_daemon.raw.log" 2>&1 || true
-          # Relay-side view of the protocol: whether the kind-38383 in-progress
-          # revision was ever accepted, and how the later REQs were answered.
-          docker logs --timestamps nostr_relay > "$RUNNER_TEMP/phase6a_relay.raw.log" 2>&1 || true
+          # Relay-side view of the protocol: whether the kind-38383 revisions
+          # were accepted and how the later REQs were answered. `docker logs`
+          # needs the real container, not the compose service name (the name
+          # `nostr_relay` does not exist as a container and silently produced
+          # "No such container" in run 43205148657).
+          cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
+          if [ -n "$cid" ]; then
+            docker logs --timestamps "$cid" > "$RUNNER_TEMP/phase6a_relay.raw.log" 2>&1 || true
+            docker inspect -f 'relay_container={{.Name}} id={{.Id}} state={{.State.Status}} started_at={{.State.StartedAt}} restarts={{.RestartCount}}' "$cid" \
+              > "$RUNNER_TEMP/phase6a_relay_identity.txt" 2>&1 || true
+          else
+            docker compose logs --no-color --timestamps nostr_relay > "$RUNNER_TEMP/phase6a_relay.raw.log" 2>&1 || true
+            echo "relay container not found via docker compose ps -q" > "$RUNNER_TEMP/phase6a_relay_identity.txt"
+          fi
+          docker compose ps -a > "$RUNNER_TEMP/phase6a_compose_ps.txt" 2>&1 || true
           python3 - "$RUNNER_TEMP" "$D" <<'PY'
           import json, os, pathlib, re, sys
           rt = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2])
@@ -893,8 +1120,41 @@ jobs:
           (out / 'daemon_events.log').write_text(('\n'.join(lines) + '\n') if lines else '')
           relay_raw = rt / 'phase6a_relay.raw.log'
           if relay_raw.exists():
-              relay_lines = [sanitize(l[:500]) for l in relay_raw.read_text(errors='replace').splitlines()[-4000:]]
+              body = relay_raw.read_text(errors='replace').splitlines()
+              relay_lines = [sanitize(l[:500]) for l in body[-20000:]]
               (out / 'relay_events.log').write_text(('\n'.join(relay_lines) + '\n') if relay_lines else '')
+              # Everything the relay said about this order and about the two
+              # decisions that can hide an event (replaceable pruning, far
+              # future-dated rejection, failing subscription queries).
+              order_hint = ''
+              oid = rt / 'order_id.txt'
+              if oid.exists():
+                  order_hint = oid.read_text(errors='replace').strip()
+              needles = [n for n in (order_hint, 'removed', 'far future',
+                                     'Subscription error', 'scraper', 'invalid event',
+                                     'duplicate subscription', 'expired') if n]
+              matched = []
+              for line in body:
+                  low = line.lower()
+                  if any(n.lower() in low for n in needles):
+                      matched.append(sanitize(line[:500]))
+              (out / 'relay_events_matches.log').write_text(
+                  ('\n'.join(matched[-2000:]) + '\n') if matched else '')
+          identity = rt / 'phase6a_relay_identity.txt'
+          if identity.exists():
+              (out / 'relay_identity.txt').write_text(sanitize(identity.read_text(errors='replace')))
+          ps = rt / 'phase6a_compose_ps.txt'
+          if ps.exists():
+              (out / 'compose_ps.txt').write_text(sanitize(ps.read_text(errors='replace')[-20000:]))
+          # Relay visibility diagnostics: the control-query matrix and the
+          # read-only sqlite inspection of the relay database.
+          for src, dest in (('relay_matrix/summary.log', 'relay_matrix_summary.log'),
+                            ('relay_matrix/raw.log', 'relay_matrix_raw.log'),
+                            ('relaydb/analysis.txt', 'relay_db_analysis.txt'),
+                            ('relaydb/db_listing.txt', 'relay_db_listing.txt')):
+              p = rt / src
+              if p.exists():
+                  (out / dest).write_text(sanitize(p.read_text(errors='replace')[-80000:]))
           # Full daemon kind-38383 view: the end-of-run dump plus every distinct
           # revision the live watcher saw while the trade was running.
           for name, dest in (('daemon38383_all.json', 'order38383_all.json'),
@@ -1003,7 +1263,8 @@ jobs:
           cid=$(docker compose ps -q nostr_relay 2>/dev/null || true)
           if [ -n "$cid" ]; then docker exec "$cid" sh -c 'rm -rf /tmp/evidence /tmp/maker.sh /tmp/findhold.sh /tmp/maker.hex' || true; fi
           rm -rf "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/phase6a_diagnostics" "$RUNNER_TEMP/phase6a_daemon.raw.log" \
-                 "$RUNNER_TEMP/phase6a_relay.raw.log" \
+                 "$RUNNER_TEMP/phase6a_relay.raw.log" "$RUNNER_TEMP/relay_matrix" "$RUNNER_TEMP/relaydb" \
+                 "$RUNNER_TEMP/nak-host" \
                  "$RUNNER_TEMP"/phase6a_* "$RUNNER_TEMP/maker.hex" "$RUNNER_TEMP/maker.pub" "$RUNNER_TEMP/daemon.nsec" \
                  "$RUNNER_TEMP/daemon.pub" "$RUNNER_TEMP/settings.toml" "$RUNNER_TEMP/maker.sh" "$RUNNER_TEMP/findhold.sh" \
                  "$RUNNER_TEMP/payer.sh" "$RUNNER_TEMP/payer.out" "$RUNNER_TEMP/payer.pid" "$RUNNER_TEMP/payer.status" \
