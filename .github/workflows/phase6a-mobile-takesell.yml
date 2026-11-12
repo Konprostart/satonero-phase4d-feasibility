@@ -31,7 +31,7 @@ jobs:
     env:
       DAEMON_SHA: 378a5c60833adee143861c5c8e9c5eb0544ec0a7
       REGTEST_SHA: c6adbdaaaf0a2152a0728dbce6adf11945f547bd
-      MOBILE_SHA: 22ec7cb0d0cdfd7f492ca707f370861b13332658
+      MOBILE_SHA: 18b294321e3c6fd7821fc9b9051900e101059a61
       # android/app/build.gradle throws at configuration time when no release
       # keystore exists, so every Gradle invocation in this job needs the same
       # CI-only escape hatch that Satonero-mobile's own workflows use
