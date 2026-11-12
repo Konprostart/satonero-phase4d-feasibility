@@ -701,21 +701,26 @@ jobs:
           echo 'gate 6A-0 ok: maker order rendered in the app order book'
           echo 'gate 6A ok: app reported role=buyer status=active'
 
-          # (2) The daemon published the active order event.
+          # (2) The daemon published the in-progress revision of the order.
+          # `Active` is an internal status: create_status_tags() (src/nip33.rs)
+          # returns create_event=false for it, so the daemon does NOT publish an
+          # s=active revision (this is the dead probe already dropped in Phase
+          # 5A). The last publishable revision of this order is s=in-progress,
+          # which proves the daemon accepted the take and moved it off the book.
           : > "$RUNNER_TEMP/active38383.json"
           for i in $(seq 1 30); do
             timeout 40 docker compose exec -T nostr_relay nak -v req -k 38383 -a "$DAEMON_PUB" -t d="$ORDER" --limit 10 \
-              --jq 'select(any(.tags[]; .[0]=="s" and .[1]=="active"))' ws://localhost:8080 < /dev/null \
+              --jq 'select(any(.tags[]; .[0]=="s" and .[1]=="in-progress"))' ws://localhost:8080 < /dev/null \
               > "$RUNNER_TEMP/active38383.json" 2>/dev/null || true
             jq -e 'select(.kind == 38383)' "$RUNNER_TEMP/active38383.json" >/dev/null 2>&1 && break
             sleep 5
           done
-          jq -e 'select(.kind == 38383 and (.tags | any(.[0]=="s" and .[1]=="active")))' \
+          jq -e 'select(.kind == 38383 and (.tags | any(.[0]=="s" and .[1]=="in-progress")))' \
             "$RUNNER_TEMP/active38383.json" >/dev/null 2>&1 \
-            || { echo 'FAIL: daemon never published status active for the order'; exit 1; }
+            || { echo 'FAIL: daemon never published status in-progress for the order'; exit 1; }
           docker compose exec -T nostr_relay nak verify < "$RUNNER_TEMP/active38383.json" >/dev/null 2>&1 \
-            || { echo 'FAIL: active order event signature'; exit 1; }
-          echo 'daemon published a signed kind-38383 active event'
+            || { echo 'FAIL: in-progress order event signature'; exit 1; }
+          echo 'daemon published a signed kind-38383 in-progress event'
 
           # (3) The app's own protocol messages are on the relay.
           timeout 40 docker compose exec -T nostr_relay nak req -k 14 -t p="$DAEMON_PUB" --limit 200 ws://localhost:8080 < /dev/null \
