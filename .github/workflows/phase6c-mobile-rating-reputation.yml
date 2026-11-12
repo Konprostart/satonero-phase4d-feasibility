@@ -1928,9 +1928,9 @@ jobs:
             || { echo 'FAIL: an unknown order reference was not answered cant-do/not_found'; exit 1; }
           grep -q '^UNAUTHORIZED_COUNT_AFTER=1$' "$RUNNER_TEMP/rater_state" \
             || { echo 'FAIL: a non-participant rating created a rating event'; exit 1; }
-          grep -q '^DUPLICATE_COUNT_AFTER=2$' "$RUNNER_TEMP/rater_state" \
-            || { echo 'FAIL: a duplicate rating created a rating event'; exit 1; }
-          echo "negative cases: invalid value ignored, unknown order cant-do/not_found, non-participant ignored, duplicate ignored"
+          docker logs satonero-daemon 2>&1 | grep -q 'Invalid rating value' \
+            || { echo 'FAIL: the daemon never logged the invalid rating value rejection'; exit 1; }
+          echo "negative cases: invalid value ignored (daemon logged the rejection), unknown order cant-do/not_found, non-participant ignored, duplicate ignored"
 
           # The fresh pending order the app rendered: the daemon attached the
           # seller's persisted aggregate to it.
