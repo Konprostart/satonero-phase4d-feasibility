@@ -10,9 +10,12 @@ name: phase6e-m1-rc-conformance
 #
 # This file is the proven Phase 6D gate (phase6d-rating-conformance) with only
 # its identity and pins changed:
-#   daemon  389b6a958360e53af8c0419650ef32264d5ec341  (main: kind-38384 rated-key fix)
-#   mobile  4baf81dce265d14f6e9f6308d3877f965d02e4c7  (main: top-banner fix +
-#                                                      merged regtest driver)
+#   daemon  bfe6a83bf4f93498225e9125fe65c9f35a8e1065  (main: kind-38384 rated-key
+#                                                      fix + release-publication guard
+#                                                      + docker promote-latest no-op)
+#   mobile  e2ef2591255ed4f3bf6f25a08a8482e3f534daea  (main: top-banner fix +
+#                                                      merged regtest driver + hardened
+#                                                      gated release workflow)
 # No gate, assertion, timeout, negative check or cleanup step is weakened,
 # removed or reordered relative to Phase 6D. Phase 6A, 6B, 6C and 6D are not
 # touched: their successful evidence stays valid, including 6B's "no settlement"
@@ -60,9 +63,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     env:
-      DAEMON_SHA: 389b6a958360e53af8c0419650ef32264d5ec341
+      DAEMON_SHA: bfe6a83bf4f93498225e9125fe65c9f35a8e1065
       REGTEST_SHA: c6adbdaaaf0a2152a0728dbce6adf11945f547bd
-      MOBILE_SHA: 4baf81dce265d14f6e9f6308d3877f965d02e4c7
+      MOBILE_SHA: e2ef2591255ed4f3bf6f25a08a8482e3f534daea
       # android/app/build.gradle throws at configuration time when no release
       # keystore exists, so every Gradle invocation in this job needs the same
       # CI-only escape hatch that Satonero-mobile's own workflows use
