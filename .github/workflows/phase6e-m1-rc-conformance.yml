@@ -10,7 +10,7 @@ name: phase6e-m1-rc-conformance
 #
 # This file is the proven Phase 6D gate (phase6d-rating-conformance) with only
 # its identity and pins changed:
-#   daemon  bfe6a83bf4f93498225e9125fe65c9f35a8e1065  (main: kind-38384 rated-key
+#   daemon  9efe32e6945e24e23cc1ecfa1b382d0ec98148c3  (main: kind-38384 rated-key
 #                                                      fix + release-publication guard
 #                                                      + docker promote-latest no-op)
 #   mobile  e2ef2591255ed4f3bf6f25a08a8482e3f534daea  (main: top-banner fix +
@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     env:
-      DAEMON_SHA: bfe6a83bf4f93498225e9125fe65c9f35a8e1065
+      DAEMON_SHA: 9efe32e6945e24e23cc1ecfa1b382d0ec98148c3
       REGTEST_SHA: c6adbdaaaf0a2152a0728dbce6adf11945f547bd
       MOBILE_SHA: e2ef2591255ed4f3bf6f25a08a8482e3f534daea
       # android/app/build.gradle throws at configuration time when no release
